@@ -410,10 +410,13 @@ class DouyinParser(BaseParser):
         try:
             detail = await self._fetch_aweme_detail(video_id)
         except (ClientError, TimeoutError, ValueError, ParseException) as e:
-            logger.debug(f"[抖音] 实况直链补充查询失败: {e}")
+            # 这里若静默失败，用户只会看到「实况变静态图」而没有任何提示，
+            # 因此用 warning 级记录，便于在面板日志里定位。
+            logger.warning(f"[抖音] 实况直链获取失败，本次将发送静态图: {e}")
             return {}
 
         if not detail:
+            logger.warning("[抖音] 实况直链获取失败：详情接口未返回作品数据")
             return {}
 
         live_map: dict[int, str] = {}

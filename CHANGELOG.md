@@ -1,5 +1,23 @@
 # 更新日志
 
+## v1.7.2
+
+### 修复
+
+- **实况直链获取失败时不再静默**：`_fetch_live_map()` 过去把异常记在 `logger.debug` 后返回空集合，
+  用户只会看到「图文作品的实况变成了静态图」而没有任何提示。现改为 `warning` 级并写明原因
+  （详情接口 403 / 浏览器兜底不可用等），可在 AstrBot 面板日志里直接定位。
+
+### 新增
+
+- `tools/diagnose_douyin.py`：抖音浏览器兜底环境自检脚本。不依赖插件任何模块，可单独拷到服务器运行，
+  依次检查 Python 环境 → playwright 可导入 → Chromium 内核是否已下载 → 能否启动（含 `--no-sandbox`）
+  → 能否打开抖音首页并拿到风控 Cookie → 能否经页面代发 `aweme/detail` 并取到实况 mp4 直链。
+  ```bash
+  python tools/diagnose_douyin.py                 # 用内置样本作品
+  python tools/diagnose_douyin.py <aweme_id>      # 指定作品
+  ```
+
 ## v1.7.1
 
 ### 修复

@@ -139,6 +139,19 @@ pip install -r requirements.txt
 **排查**：若会话里报「浏览器代发请求失败」，AstrBot 日志里会有一行 `[browser] ...` 说明真实原因
 （内核未下载 / 缺系统库 / 无法启动），按提示处理即可。
 
+**一键自检**（服务器上直接跑，不依赖插件模块）：
+
+```bash
+python tools/diagnose_douyin.py                 # 用内置样本作品做全链路检查
+python tools/diagnose_douyin.py <aweme_id>      # 检查指定作品
+```
+
+它会依次验证：Python 环境 → playwright 可导入 → Chromium 内核 → 浏览器能否启动 →
+抖音首页与风控 Cookie → 页面代发详情接口 → 实况直链是否真的取到，逐项给出通过/失败与修复命令。
+
+> **现象对照**：图文作品「实况变成静态图」而群里没有任何报错，通常就是这条链路失败了 ——
+> v1.7.2 起会在日志里以 `warning` 写明原因（旧版本是 `debug`，看不见）。
+
 ---
 
 ## ⚙️ 配置
