@@ -120,7 +120,24 @@ pip install -r requirements.txt
 ```
 
 - 抖音的**浏览器兜底**需要 `playwright`。Windows / macOS 上会优先复用系统已安装的 Edge / Chrome，**无需再下载浏览器**；
-- Linux / Docker 环境请另执行 `playwright install --with-deps chromium`，并把配置项「浏览器通道」留空。
+- **Linux / Docker 上只 `pip install playwright` 是不够的**，还要装浏览器内核与系统库：
+
+  ```bash
+  # 一键脚本（自动识别 apt / yum / dnf，并做启动冒烟测试）
+  # 在 AstrBot 服务器上执行，Docker 请先 docker exec 进容器
+  bash tools/setup_browser.sh /root/AstrBot/venv
+
+  # 或手动执行
+  python -m playwright install chromium
+  python -m playwright install-deps chromium   # Debian/Ubuntu
+  ```
+
+  > CentOS / 阿里云 Linux 等 RHEL 系系统上 `install-deps` 不支持 apt 流程，需手动 `yum install`。
+  > `tools/setup_browser.sh` 已内置这些分支。
+  并且把配置项「浏览器通道」留空（Linux 上没有 Edge）。
+
+**排查**：若会话里报「浏览器代发请求失败」，AstrBot 日志里会有一行 `[browser] ...` 说明真实原因
+（内核未下载 / 缺系统库 / 无法启动），按提示处理即可。
 
 ---
 
@@ -242,7 +259,15 @@ class ExampleParser(BaseParser):
 A：先确认该平台的解析器已启用（`/解析帮助` 会列出当前已启用的平台），再看是否需要 Cookie 登录态。
 
 **Q：抖音的 `/全部`、`/全部音乐` 报接口错误？**
-A：确认抖音解析器的「浏览器兜底」为开启状态，并确保运行环境已安装 `playwright`。平台风控策略会持续变化，浏览器兜底是当前最稳的路径。
+A：确认抖音解析器的「浏览器兜底」为开启状态，并确保运行环境已装好 `playwright` 及其浏览器内核。
+平台风控策略会持续变化，浏览器兜底是当前最稳的路径。
+
+**Q：会话里报「浏览器代发请求失败」？**
+A：这是浏览器兜底启动失败。看 AstrBot 日志里的 `[browser]` 行，会直接写明原因：
+`未下载浏览器内核` → 执行 `python -m playwright install chromium`；
+`缺少系统库` → 执行 `python -m playwright install-deps chromium`（RHEL 系需手动 yum）；
+`root 环境` → v1.7.1 起已自动附加 `--no-sandbox`，升级到该版本即可。
+Linux 服务器上直接跑 `bash tools/setup_browser.sh` 一次装齐并验证。
 
 **Q：实况图只发了静态图？**
 A：确认作品本身带实况；快手（含极速版）暂不支持取实况视频。抖音实况依赖详情接口，若浏览器兜底未生效也会退化为静态图。

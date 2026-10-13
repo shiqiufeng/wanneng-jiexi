@@ -21,6 +21,7 @@ Cookie）都会被拒，返回：
 from __future__ import annotations
 
 import asyncio
+import os
 from typing import Any
 
 from astrbot.api import logger
@@ -89,6 +90,8 @@ class BrowserFetcher:
         self._page: Any = None
         self._lock = asyncio.Lock()
         self._idle_handle: asyncio.TimerHandle | None = None
+        # 最近一次启动/请求失败的原因，便于调用方把真实错误透给用户与日志
+        self.last_error: str | None = None
 
     @staticmethod
     def available() -> bool:
@@ -96,6 +99,19 @@ class BrowserFetcher:
         return async_playwright is not None
 
     # ---------------- 生命周期 ----------------
+
+    @staticmethod
+    def launch_args() -> list[str]:
+        """Chromium 启动参数
+
+        Linux 云主机/容器通常以 root 运行，Chromium **必须**带 ``--no-sandbox``
+        才肯启动（否则报 "Running as root without --no-sandbox is not supported"）；
+        容器里 ``/dev/shm`` 往往只有 64 MB，``--disable-dev-shm-usage`` 可避免页面崩溃。
+        """
+        args = ["--disable-blink-features=AutomationControlled"]
+        if os.name == "posix":
+            args += ["--no-sandbox", "--disable-dev-shm-usage", "--disable-gpu"]
+        return args
 
     async def _ensure_page(self) -> Any:
         """确保浏览器与页面就绪（首次调用时启动）"""
@@ -107,7 +123,8 @@ class BrowserFetcher:
             if self._page is not None and not self._page.is_closed():
                 return self._page
             if async_playwright is None:
-                raise RuntimeError("未安装 playwright，无法使用浏览器兜底")
+                self.last_error = "未安装 playwright（pip install playwright）"
+                raise RuntimeError(self.last_error)
 
             self._pw = await async_playwright().start()
 
@@ -122,7 +139,7 @@ class BrowserFetcher:
                 try:
                     self._browser = await self._pw.chromium.launch(
                         headless=self.headless,
-                        args=["--disable-blink-features=AutomationControlled"],
+                        args=self.launch_args(),
                         **extra,
                     )
                     logger.info(f"[browser] 浏览器已启动: {extra or 'chromium'}")
@@ -133,26 +150,47 @@ class BrowserFetcher:
 
             if self._browser is None:
                 await self._shutdown()
-                raise RuntimeError(f"浏览器启动失败: {last_err}")
+                hint = self._launch_hint(last_err)
+                self.last_error = f"浏览器启动失败: {last_err}{hint}"
+                raise RuntimeError(self.last_error)
 
-            self._context = await self._browser.new_context(
-                user_agent=UA,
-                locale="zh-CN",
-                viewport={"width": 1440, "height": 900},
-            )
-            await self._context.add_init_script(
-                "Object.defineProperty(navigator,'webdriver',{get:()=>undefined});"
-            )
-            self._page = await self._context.new_page()
-            await self._page.goto(
-                self.HOME,
-                wait_until="domcontentloaded",
-                timeout=self.nav_timeout * 1000,
-            )
-            # 等 secsdk 加载完成并把风控 cookie 种下
-            await self._page.wait_for_timeout(self.warmup_wait)
+            try:
+                self._context = await self._browser.new_context(
+                    user_agent=UA,
+                    locale="zh-CN",
+                    viewport={"width": 1440, "height": 900},
+                )
+                await self._context.add_init_script(
+                    "Object.defineProperty(navigator,'webdriver',{get:()=>undefined});"
+                )
+                self._page = await self._context.new_page()
+                await self._page.goto(
+                    self.HOME,
+                    wait_until="domcontentloaded",
+                    timeout=self.nav_timeout * 1000,
+                )
+                # 等 secsdk 加载完成并把风控 cookie 种下
+                await self._page.wait_for_timeout(self.warmup_wait)
+            except Exception as e:  # noqa: BLE001
+                await self._shutdown()
+                self.last_error = f"打开抖音首页失败: {e}"
+                raise RuntimeError(self.last_error) from e
+
+            self.last_error = None
             logger.info("[browser] 抖音页面就绪，接口请求将经页面代发")
             return self._page
+
+    @staticmethod
+    def _launch_hint(err: Exception | None) -> str:
+        """根据底层报错给出可执行的修复提示"""
+        text = str(err or "")
+        if "Executable doesn't exist" in text or "playwright install" in text:
+            return "；未下载浏览器内核，请执行 `python -m playwright install chromium`"
+        if "No such file or directory" in text and "chrome" in text.lower():
+            return "；系统无可用 Chrome/Edge，请执行 `python -m playwright install chromium`"
+        if "error while loading shared libraries" in text or "Host system is missing" in text:
+            return "；缺少系统库，请执行 `python -m playwright install-deps chromium`（CentOS/阿里云需手动 yum 装依赖）"
+        return ""
 
     async def _shutdown(self) -> None:
         """关闭页面/浏览器并释放 playwright"""
@@ -219,6 +257,7 @@ class BrowserFetcher:
             )
         except Exception as e:  # noqa: BLE001
             logger.warning(f"[browser] 页面内请求异常: {e}")
+            self.last_error = f"页面内请求异常: {e}"
             # 页面可能已崩溃，关掉让下次重建
             await self.close()
             return None
@@ -229,6 +268,7 @@ class BrowserFetcher:
         text = result.get("text") or ""
         if status != 200:
             logger.warning(f"[browser] 页面内请求返回状态 {status}: {url[:90]}")
+            self.last_error = f"页面内请求返回状态 {status}"
             return None
 
         import json
@@ -237,5 +277,7 @@ class BrowserFetcher:
             body = json.loads(text)
         except ValueError:
             logger.warning(f"[browser] 响应不是合法 JSON: {text[:120]}")
+            self.last_error = "响应不是合法 JSON"
             return None
+        self.last_error = None
         return body if isinstance(body, dict) else None

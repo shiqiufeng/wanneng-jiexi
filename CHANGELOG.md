@@ -1,5 +1,31 @@
 # 更新日志
 
+## v1.7.1
+
+### 修复
+
+- **修复 Linux 服务器（尤其以 root 运行的云主机 / 容器）上抖音浏览器兜底报
+  「浏览器代发请求失败」的问题**：Chromium 在 root 下必须带 `--no-sandbox` 才能启动，
+  容器 `/dev/shm` 过小时还需 `--disable-dev-shm-usage`。`core/browser.py` 新增
+  `launch_args()`，在 POSIX 平台自动附加
+  `--no-sandbox --disable-dev-shm-usage --disable-gpu`（Windows 行为不变）。
+
+### 变更
+
+- 浏览器兜底失败时**不再只抛笼统提示**：`BrowserFetcher` 记录 `last_error`，
+  并针对「内核未下载」「缺系统库」「系统无 Chrome/Edge」分别给出可执行的修复提示，
+  错误会直接显示在会话里，同时写入 AstrBot 日志的 `[browser]` 行。
+
+### 新增
+
+- 新增 `tools/setup_browser.sh`：Linux 服务器一键安装 playwright 的 Chromium 内核与系统依赖
+  （自动识别 apt / yum / dnf），并做一次「真实启动 + 打开抖音首页」冒烟测试。
+
+### 部署提示
+
+- Linux / Docker 上，仅 `pip install playwright` 不够，必须再执行
+  `python -m playwright install chromium`；Docker 请在容器内执行。
+
 ## v1.7.0
 
 ### 变更

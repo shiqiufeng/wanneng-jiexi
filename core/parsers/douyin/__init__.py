@@ -649,7 +649,8 @@ class DouyinParser(BaseParser):
         url = f"{endpoint}?{urlencode(params, safe='')}"
         body = await self.browser.get_json(url, referer=referer)
         if body is None:
-            raise ParseException("浏览器代发请求失败，请稍后再试")
+            reason = self.browser.last_error or "未知原因"
+            raise ParseException(f"浏览器代发请求失败：{reason}")
 
         status = body.get("status_code")
         if status not in (0, None):
