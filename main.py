@@ -1097,30 +1097,31 @@ class ParserPlugin(Star):
                 )
                 lines.append(f"[{'通过' if ok else '失败'}] {label}：{'可用' if ok else reason}")
 
-            ok, reason = await uploader.probe(
-                bot,
-                "do_group_album_comment",
-                group_id=gid,
-                album_id=album.album_id,
-                lloc="",
-                content="",
-            )
-            lines.append(f"[{'通过' if ok else '失败'}] 文案写评论：{'可用' if ok else reason}")
+            # 评论通路：真实发一次（参数形状填完整、含必填的 lloc），把协议端
+            # 自己的参数校验和上游原生 bug 直接摊给用户，而不是等上传完才发现
+            # 文案一个字都没写进相册。
+            ok, reason = await uploader.comment_probe(bot, gid, album)
+            if ok:
+                lines.append(
+                    "[通过] 文案写评论：" + (f"可用（{reason}）" if reason else "可用")
+                )
+            else:
+                lines.append(f"[失败] 文案写评论：{reason}")
 
             # 实读一次媒体列表：文案能不能写进去，全看这里能不能解析出
-            # 「本次上传的那条说说」。这一步的输出是排查文案问题的一手证据。
+            # 「本次上传的那条媒体」。原始键名一并打出来 —— lloc 挂在
+            # image.lloc 还是 video.cover.lloc 完全由协议端决定，这是排查
+            # 「图片传上去了、文案一个字都没有」最快的一手证据。
             try:
-                targets = await uploader.media_targets(bot, gid, album)
+                targets, dump = await uploader.media_dump(bot, gid, album)
             except AlbumError as e:
                 lines.append(f"[失败] 读取相册媒体列表：{e}")
             else:
-                lines.append(f"[通过] 相册媒体列表：解析到 {len(targets)} 个可评论目标")
-                for index, target in enumerate(targets[:3], start=1):
-                    lines.append(f"  {index}. {target.describe()}")
+                lines.extend(dump)
                 if not targets:
                     lines.append(
-                        "  说明：接口返回里没有 lloc / batch_id 字段，"
-                        "文案无法写入，请把本行所在日志发给作者"
+                        "  说明：没解析出 lloc（评论接口只认 lloc），文案无法写入，"
+                        "请把上面「媒体列表」几行发给作者"
                     )
 
         # 建/删相册的两条通路：候选 action 是否被认得 + 原始发包后端是否可用。

@@ -1,5 +1,78 @@
 # 更新日志
 
+## v1.9.1
+
+> 修复「视频/图片传进相册了，作品文案一个字都没写进去」——回执里只有一串
+> `retcode 1400 Schema compilation error: Expected required property`。
+> 根因是评论请求的参数形状错了：**发的是 `batch_id`，而协议端要的是必填的 `lloc`**。
+
+### 修复
+
+- **文案写评论的参数形状**：`do_group_album_comment` 现在**有 `lloc` 就只发
+  `lloc`**，拿不到 `lloc` 时才退到只发 `batch_id`（按整条说说评论）。旧实现
+  反过来「先按批次评论、失败再退到单图」，而 NapCat ≤ v4.18.38 的
+  `payloadSchema` 是 `{group_id, album_id, lloc(必填), content}` —— 那边**根本
+  没有 `batch_id` 这个字段**，于是请求被协议端自己的 Schema 校验当场打回
+  （retcode 1400，`Expected required property`），文案一个字都进不去。
+  来源：`NapCatQQ@v4.18.38:packages/napcat-onebot/action/extends/DoGroupAlbumComment.ts`。
+- **评论目标的定位**：不再整树瞎扫、不再只认 `media_list` 一个键名并取第 0 条。
+  现在以**媒体条目**为单位解析，`lloc` 按真实结构取 —— 图片在 `media_list[].image.lloc`，
+  **视频在 `media_list[].video.cover.lloc`**，`batch_id` / `upload_time` 从**条目本身**
+  继承（来源：LLOneBot `GetGroupAlbumMediaList` 的响应类型）。
+  同时刻意**不收 `album.cover` 这类同构节点**：相册封面往往就是最新那张图，
+  混进来会把文案评论到封面条目下。键名兼容 `mediaList` / `media`，也认老的
+  `cell_media.media_items[].image.lloc` 嵌套结构。
+- **致命错误当场收手**：`Schema compilation error` 与上游原生层报错
+  `Cannot convert undefined or null to object` 都与「换哪条目标」无关，遇到就
+  立即停止，不再逐个候选刷接口。
+- **如实翻译两条拦路报错**（原文对用户毫无意义）：
+  - Schema 打回 → 「协议端没收到 lloc 就把请求打回来了……把『/相册自检』里
+    媒体列表那几行发作者」；
+  - 原生层报错 → 指向**上游 bug NapNeko/NapCatQQ#1979**（QQNT 9.9.33+ 要求评论体
+    带 `like`，NapCat ≤ v4.18.38 的 `createAlbumCommentRequest` 没带，上游已于
+    2026-10-12 修复，但该提交晚于 v4.18.38 发布），提示换用含修复的构建。
+  失败原因在**展示层**翻译：判定「是不是致命」必须看原始报错，所以
+  `_comment()` 返回原文，`write_title()` 才翻成人话。
+
+- **评论目标的排序**：不再把「有 `batch_id`」当成「更新」。视频条目常常**没有
+  `batch_id`**（NapCat 的封面上传不带 `batchId`），只有 `upload_time`；旧写法把
+  「没有 batch_id」直接压到最后一级，于是**刚传的视频排在去年的旧图后面**，文案
+  会挂到旧图下面去。现在按**「离当前时间最近」**排（`batch_id` 是数字时用它，
+  否则退到条目上的 `upload_time`），并在「相册里最新的条目都超出新鲜窗口」时
+  打一条 warning 留痕。
+
+### 新增
+
+- **`/相册自检` 升级成文案通路的一手证据**：实发一次评论请求（参数形状填完整、
+  含必填的 `lloc`，用不存在的占位 `lloc` 探路），并**打印相册媒体列表的原始字段**
+  —— 顶层键、条目数、第 1 条的字段、`image` / `video` / `video.cover` 的字段、
+  解析出的可评论目标（带 `lloc`）数量与前 3 个。`lloc` 挂在哪一层完全由协议端
+  决定，字段名一变文案就会静默写不进去，摊开原始键名比事后猜快得多。
+
+### 测试
+
+- `_albumprobe/test_uploader.py` 扩到 **215 项**（+8）：按真实 `media_list` 结构
+  （图片 `image.lloc` + 视频 `video.cover.lloc`）验证目标选择与「刚上传的那条」
+  排序；**没有 `batch_id` 的新视频必须排在去年的旧图前面**；断言**只发 lloc、
+  不带 batch_id**、一次就中不刷接口；不评论相册封面；无 `lloc` 时才退到按批次
+  评论；Schema 打回与上游 bug 都**只试一次**且原因被翻译成人话（提 `lloc` /
+  提 `1979`）；非致命失败仍会换下一个候选。
+- `_fixprobe/test_commands.py` 扩到 **177 项**（+18）：静态锁定「`_comment` 返回
+  原始报错（不在里面翻译）」「lloc 与 batch_id 互斥」「致命判定覆盖 schema /
+  上游 bug / 缺 action」「致命错误在候选循环体里当场 return」「媒体目标以
+  `_media_items` 的条目为起点、没有 `media_list` 时才整树兜底」「排序按离当前
+  时间最近、用条目时间戳兜底」「自检实发评论探测并打印媒体列表原始字段」。
+
+### 说明
+
+- **视频的文案仍然只能各自评论**：视频在相册里各自成贴（封面上传不带 `batchId`），
+  所以每个视频条目各写一次评论，这点没法通过命令绕过。
+- **评论没有 trpc 原始发包的退路**：查遍 `QunAlbum.trpc.qzone.webapp_qun_media.QunMedia`
+  的命令字表，只有 `AddAlbum` / `DeleteAlbum` / `GetAlbumList` / `GetMediaList` 四条
+  （`LLOneBot:src/main/qqProtocol/direct-lib/cmd.ts`），评论走的是 QQNT 内核的
+  `NodeIKernelAlbumService` 原生调用，**无法用 `send_packet` 绕开**。因此
+  NapCat ≤ v4.18.38 上若要真正写入评论，**必须换用含 #1979 修复的构建**。
+
 ## v1.9.0
 
 > `/全部相册少女集 <主页链接>`：把主页的**每个作品**都传进「少女集」相册，

@@ -342,11 +342,32 @@ SnowLuma HTTP 地址默认为 `http://127.0.0.1:3000`。这里填写的是 **One
 | 抖音图文实况 | 静态图按图片上传，实况 mp4 按视频上传 | 图片成一条，实况各自一条 |
 | 作品文案 | 写到相册评论（`do_group_album_comment`）——上传接口没有标题/描述参数 | 挂在对应的那条说说下 |
 
-> 文案是怎么找准「本次上传那条」的：NapCat 的 `batchId` 取的是
-> `Math.floor(Date.now() / 1000)`，所以刚传完的那批 batch_id 与当前时间只差几秒；
-> 插件据此从相册的上千条历史媒体里挑出本次上传的那条（`get_group_album_media_list`
-> 的返回是 QQ 原生结构原样透传，字段名随版本变化，插件是扫全树收候选再逐个试的）。
-> 写失败会在回执里明说「文案未写入」并附原因，不会假装写成功。
+> **文案是怎么找准「本次上传那条」的**：评论接口按 `lloc` 定位单条媒体 ——
+> 图片的 `lloc` 在 `media_list[].image.lloc`，**视频的在 `media_list[].video.cover.lloc`**，
+> 插件以媒体条目为单位解析（`batch_id` / `upload_time` 从条目本身继承），并刻意
+> **不收相册封面**（封面往往就是最新那张图，混进来会把文案评论到封面条目下）。
+> 候选取不到 `lloc` 时才退到「按整条说说评论」（`batch_id`，NapCat 2026-10-12
+> 之后的新版才有这个能力）。写失败会在回执里明说「文案未写入」并附原因，
+> 不会假装写成功。
+>
+> **两个协议端的坑（都不是插件的锅，但都会被说清楚）**：
+>
+> 1. `retcode 1400 Schema compilation error: Expected required property` ——
+>    NapCat ≤ v4.18.38 的 `do_group_album_comment` 参数是
+>    `{group_id, album_id, lloc(必填), content}`，**没有 `batch_id`**。v1.9.1 起
+>    改为「有 `lloc` 就只发 `lloc`」，不会再被协议端自己的 Schema 校验打回。
+> 2. `Cannot convert undefined or null to object` —— QQNT 9.9.33+ 要求评论体带
+>    `like` 字段，而 NapCat ≤ v4.18.38 的底层请求没带（上游 bug
+>    [NapNeko/NapCatQQ#1979](https://github.com/NapNeko/NapCatQQ/issues/1979)，
+>    2026-10-12 修复，**晚于 v4.18.38 发布**）。遇到这条只能**升级 NapCat 到含
+>    该修复的构建**：评论走的是 QQNT 内核的原生调用，无法像建/删相册那样用
+>    `send_packet` 绕开（`QunAlbum.trpc.qzone.webapp_qun_media.QunMedia` 的命令字表里
+>    只有 `AddAlbum` / `DeleteAlbum` / `GetAlbumList` / `GetMediaList` 四条）。
+>
+> 不确定属于哪一种？跑一次 **`/相册自检`**：它会实发一条评论请求，并打印相册
+> 媒体列表的**原始字段**（顶层键、第 1 条的 `image` / `video` / `video.cover` 字段、
+> 解析出的可评论目标数与前 3 个），直接把两类问题分开。
+>
 > 注意：QQ 相册条目的「描述」在协议层写不了 —— NapCat 在底层请求里把 `sPicDesc`
 > 固定成空串、`sPicTitle` 固定成文件名，没有往外暴露，因此**文案只能落在评论里**。
 
@@ -452,6 +473,25 @@ A：这是 v1.8.6 修掉的 bug。NapCat 的 `upload_images_to_qun_album` 内部
 「协议端返回未知错误」，并且因为判定失败又逐张重传，把一条刷成一条一张。
 升级到 v1.8.6 即可。注意**视频无法并入图片那条说说**（NapCat 的视频链路不带
 `batchId`），会各自成贴，但同样会带上作品文案。
+
+**Q：相册里图都传上去了，文案一个字都没有？回执里一串 `Schema compilation error` / `Cannot convert undefined or null to object`？**
+A：这是**协议端**的两道坎，v1.9.1 已把参数形状改对（评论按必填的 `lloc`
+定位本次上传的那条，NapCat ≤ v4.18.38 的 `payloadSchema` 里没有 `batch_id`），
+并把两条报错都翻译成人话。若仍失败：
+
+- `Schema compilation error: Expected required property` → 插件的评论请求缺必填字段，
+  把 **`/相册自检`** 里「媒体列表」那几行发作者（`lloc` 挂在哪一层由协议端决定）；
+- `Cannot convert undefined or null to object` → 命中**上游 bug**
+  [NapNeko/NapCatQQ#1979](https://github.com/NapNeko/NapCatQQ/issues/1979)
+  （NapCat ≤ v4.18.38 的相册评论请求缺 QQNT 必需的 `like` 字段，上游 2026-10-12 修复，
+  晚于 v4.18.38 发布）。**换用含该修复的 NapCat 构建即可写入** —— 评论走 QQNT 内核的
+  原生调用，没有 `send_packet` 原始发包的退路（相册的 trpc 命令字表里只有
+  `AddAlbum` / `DeleteAlbum` / `GetAlbumList` / `GetMediaList`）。
+
+**Q：视频为什么单独成条？文案是分开写的吗？**
+A：相册里视频受协议限制各自成贴（封面上传不带 `batchId`，无法并入图片批次），
+所以每个视频条目各写一次评论；图片整批合并成一条，写一次即可。这是协议端的限制，
+不是命令能改的。
 
 **Q：相册里只有图、没有文案？**
 A：这是 v1.8.7 修掉的 bug —— 上一版图片能合并成一条，但文案一个字都没落进相册，
