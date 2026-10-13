@@ -52,6 +52,19 @@ OneBot 信封里 ``data: undefined`` 序列化后直接消失，aiocqhttp 于是
 才会把它们合并显示成**同一条说说**。逐张调用 ``upload_image_to_qun_album``
 时每张都有自己的 batchId，相册里就是一条一张。因此上传路径必须
 「先整批、后逐张」，而不是反过来。
+
+⚠️ 文案（作品标题）只能写评论
+-----------------------------
+上传接口没有标题/描述参数：NapCat 在底层请求里把 ``sPicTitle`` 固定成文件名、
+``sPicDesc`` 固定成空串，没有往外暴露，所以**相册条目的「描述」在协议层写不了**。
+唯一能把文案送进相册的是 ``do_group_album_comment``（写在那一批媒体的评论里）。
+
+``get_group_album_media_list`` 的返回是 QQ 原生结构原样透传，字段名随版本变化
+（``media_list`` / ``mediaList`` / ``media``，批次可能挂 ``batch.link_id`` 也可能在
+``media[].batch_id``）。旧实现只认 ``media_list`` 并取第 0 条，键名一变就静默
+返回空 —— 表现就是**图片传上去了、文案一个字都没写进去，而回执却照样打
+「文案：xxx」**。现在改为扫全树收候选，并用「batchId 是秒级时间戳、刚上传的那批
+必然贴近当前时间」来挑出本次上传的那条，逐个候选尝试，最后**如实回执**成败。
 """
 
 from __future__ import annotations
@@ -59,6 +72,7 @@ from __future__ import annotations
 import asyncio
 import base64
 import json
+import time
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Iterable
@@ -94,14 +108,36 @@ _TRANSIENT_HINTS = (
 _ID_KEYS = ("album_id", "id", "albumId", "albumid")
 _NAME_KEYS = ("album_name", "name", "title", "albumName")
 
-# media_list 里媒体 ID 的字段别名（顶层）
-_MEDIA_ID_KEYS = ("lloc", "media_id", "mediaId", "id", "pic_key")
+#: 媒体条目里图片 ID 的别名。只用精确名字，不认泛化的 ``id``
+#: （``cell_media`` 这类结构里也有 ``id``，会指到无关字段上）
+_LLOC_KEYS = ("lloc", "lloc_id", "llocId", "pic_key")
 
-#: 深搜时用的 ID 别名：去掉过于泛化的 ``id``，避免命中无关字段
-_MEDIA_ID_DEEP_KEYS = ("lloc", "media_id", "mediaId", "pic_key")
+#: 上传批次 ID 的别名。同批多图共用一个，用来评论「一整条说说」
+_BATCH_ID_KEYS = ("batch_id", "batchId", "batchid")
 
-#: 上传批次 ID 的别名。批内多图共用，用来评论「一整条说说」
-_BATCH_KEYS = ("batch_id", "batchId", "batchid")
+#: 批次容器里指向这条 feed 的别名（NapCat 文档原话：batch.link_id）
+_BATCH_LINK_KEYS = ("link_id", "linkId")
+
+#: 时间字段别名，用来挑「最新那一批」
+_TIME_KEYS = (
+    "upload_time",
+    "uploadTime",
+    "uploadTs",
+    "create_time",
+    "createTime",
+    "ctime",
+    "time",
+    "ts",
+)
+
+#: NapCat 的 batchId 就是秒级时间戳（``nextQunAlbumBatchId()`` 取
+#: ``Math.floor(Date.now() / 1000)``），因此**刚上传的那一批的 batch_id
+#: 必定落在当前时间附近**。用它就能把「本次上传的那条说说」从相册里
+#: 成百上千条历史媒体中确定性地挑出来，而不是盲猜 ``media_list[0]``。
+_BATCH_FRESH_WINDOW = 900
+
+#: 最多在几条候选上尝试写文案，避免在别人的历史媒体下面乱评论
+MAX_COMMENT_TARGETS = 3
 
 #: get_qun_album_list 的 data 形态：{album_list: [...], attach_info, has_more}
 #: NapCat 一定用 album_list，其余键名是给别的协议端留的余地
@@ -147,6 +183,8 @@ class UploadReport:
     """相册里新增的「说说」条数。多图一次性上传会把同批合并成 1 条"""
     titles: int = 0
     """成功写入文案的条数（评论形式）"""
+    comment_errors: list[str] = field(default_factory=list)
+    """文案写入失败的原因（如实回执，不再假装写成功）"""
     skipped: list[str] = field(default_factory=list)
     """跳过的项及原因"""
     failures: list[str] = field(default_factory=list)
@@ -169,11 +207,35 @@ class UploadReport:
             out.append(f"· 相册里合并为 {self.entries} 条")
         if self.titles:
             out.append(f"· 已写入文案：{self.titles} 条")
+        for item in self.comment_errors:
+            out.append(f"· 文案未写入：{item}")
         for item in self.skipped:
             out.append(f"· 跳过：{item}")
         for item in self.failures:
             out.append(f"· 失败：{item}")
         return out
+
+
+@dataclass(slots=True, frozen=True)
+class MediaTarget:
+    """相册里一条（或一批）可评论的媒体
+
+    ``batch_id`` 指向「一整条说说」（同批多图共用一个批次号），
+    ``lloc`` 指向单张图。两者至少有一个非空。
+    """
+
+    batch_id: str = ""
+    lloc: str = ""
+    stamp: int = 0
+    """从响应里读到的时间戳；0 表示这条没带时间字段"""
+
+    def describe(self) -> str:
+        bits = []
+        if self.batch_id:
+            bits.append(f"batch_id={self.batch_id}")
+        if self.lloc:
+            bits.append(f"lloc={self.lloc[:16]}")
+        return " ".join(bits) or "（空目标）"
 
 
 def _first(mapping: dict[str, Any], keys: Iterable[str]) -> str:
@@ -529,38 +591,108 @@ class GroupAlbumUploader:
                 return False, "协议端不支持该 action（NapCat 需 v4.18.30+）"
         return True, self._fail_reason(resp)
 
-    # ---------------- 上传 ----------------
+    # ---------------- 相册媒体定位（写文案用） ----------------
 
     @staticmethod
-    def _deep_get(node: Any, keys: tuple[str, ...], *, max_depth: int = 6) -> str:
-        """在嵌套结构里深度优先找第一个非空字段
+    def _stamp(node: dict[str, Any]) -> int:
+        """从媒体条目里读一个秒级时间戳，读不到返回 0"""
+        for key in _TIME_KEYS:
+            if key not in node:
+                continue
+            try:
+                value = int(str(node[key]).strip())
+            except (TypeError, ValueError):
+                continue
+            if value > 1_000_000_000_000:  # 毫秒
+                return value // 1000
+            if value > 1_000_000_000:  # 秒
+                return value
+        return 0
 
-        NapCat 的 ``media_list`` 元素是 QQ 原生的 feed 结构，``lloc`` /
-        ``batch_id`` 埋得比较深（形如 ``cell_media.batch_id``、
-        ``cell_media.media_items[].image.lloc``），顶层直接取会一无所获，
-        表现就是「上传成功了但文案没写进去」。这里做一次受限深搜。
+    @classmethod
+    def _collect_targets(cls, data: Any, *, max_depth: int = 8) -> list[MediaTarget]:
+        """把 ``get_group_album_media_list`` 的返回扫成候选评论目标
+
+        NapCat 只是把 QQ 原生的 ``getMediaList`` 响应原样透传，字段名随版本
+        变化（``media_list`` / ``mediaList`` / ``media``，批次可能挂在
+        ``batch.link_id`` 也可能在 ``media[].batch_id``），所以这里不猜具体
+        字段名，而是**整棵树扫一遍**：凡是带 ``lloc`` 或 ``batch_id`` 的对象
+        都收下来，去重后按时间倒序排。
+
+        旧实现只认 ``media_list`` 这一个键名并取第 0 条，字段名一变就静默
+        返回空 —— 表现就是「图片传上去了，文案一个字都没有」。
         """
-        stack: list[tuple[Any, int]] = [(node, 0)]
+        found: list[MediaTarget] = []
+        seen: set[tuple[str, str]] = set()
+        stack: list[tuple[Any, int]] = [(data, 0)]
         while stack:
-            current, depth = stack.pop(0)
+            node, depth = stack.pop(0)
             if depth > max_depth:
                 continue
-            if isinstance(current, dict):
-                for key in keys:
-                    value = current.get(key)
-                    if value is None:
-                        continue
-                    text = str(value).strip()
-                    if text:
-                        return text
-                for value in current.values():
+            if isinstance(node, dict):
+                batch = _first(node, _BATCH_ID_KEYS) or _first(node, _BATCH_LINK_KEYS)
+                lloc = _first(node, _LLOC_KEYS)
+                if batch or lloc:
+                    key = (batch, lloc)
+                    if key not in seen:
+                        seen.add(key)
+                        found.append(MediaTarget(batch, lloc, cls._stamp(node)))
+                for value in node.values():
                     if isinstance(value, (dict, list)):
                         stack.append((value, depth + 1))
-            elif isinstance(current, list):
-                for value in current:
+            elif isinstance(node, list):
+                for value in node:
                     if isinstance(value, (dict, list)):
                         stack.append((value, depth + 1))
-        return ""
+        # 带时间戳的排在前面（新的在前），没时间戳的保持原顺序
+        found.sort(key=lambda target: -target.stamp)
+        return found
+
+    @staticmethod
+    def _rank_targets(targets: list[MediaTarget], now: int) -> list[MediaTarget]:
+        """把「本次上传的那一批」排到最前
+
+        NapCat 的 batchId 取自 ``Math.floor(Date.now() / 1000)``，因此刚传完的
+        那批 batch_id 与当前时间只差几秒；相册里成百上千条历史媒体不可能落在
+        这个窗口里。用它就能确定性地挑出「刚上传的那条说说」，而不是盲猜列表
+        第一条（相册按更新时间倒序不保证，猜错就把文案评论到别人的图下面）。
+        """
+
+        def score(target: MediaTarget) -> tuple[int, int]:
+            if target.batch_id.isdigit():
+                delta = abs(now - int(target.batch_id))
+                if delta <= _BATCH_FRESH_WINDOW:
+                    return (0, delta)  # 本次上传，越接近当前时间越优先
+                return (1, 0)
+            return (2, 0)  # 只有 lloc，或 batch_id 不是时间戳
+
+        return sorted(targets, key=score)
+
+    async def media_targets(
+        self, bot: Any, group_id: str, album: Album
+    ) -> list[MediaTarget]:
+        """读取相册媒体列表，返回按「最可能是本次上传」排序的评论目标
+
+        Raises:
+            AlbumError: 接口不可用，或协议端明确返回失败
+        """
+        resp = await self._call(
+            bot,
+            "get_group_album_media_list",
+            group_id=str(group_id),
+            album_id=album.album_id,
+        )
+        if not self._ok(resp):
+            raise AlbumError(f"读取相册媒体列表失败：{self._fail_reason(resp)}")
+
+        data = self._payload(resp)
+        targets = self._collect_targets(data)
+        logger.debug(
+            "[album] 相册媒体列表顶层键 "
+            f"{list(data)[:16] if isinstance(data, dict) else type(data).__name__}"
+            f"，解析出 {len(targets)} 个候选评论目标"
+        )
+        return self._rank_targets(targets, int(time.time()))
 
     def _file_candidates(self, path: Path) -> list[str]:
         """file 参数候选：优先本地路径，必要时退化为 base64"""
@@ -746,75 +878,91 @@ class GroupAlbumUploader:
         report.failures.append(f"视频 {path.name}：{reason}")
         return False
 
-    async def write_title(
-        self, bot: Any, group_id: str, album: Album, text: str
-    ) -> bool:
-        """把作品文案写成相册里**最新那条说说**的评论
-
-        群相册上传接口本身没有标题/描述参数，评论是 NapCat 能提供的最接近的
-        落点。整批图片会被合并成一条说说，因此一次调用就够覆盖整批；视频各自
-        成贴，需要每个条目调一次。任何一步拿不到就放弃，不影响上传结果。
-        """
-        text = (text or "").strip()
-        if not text:
-            return False
-        try:
-            resp = await self._call(
-                bot,
-                "get_group_album_media_list",
-                group_id=str(group_id),
-                album_id=album.album_id,
-            )
-        except AlbumError:
-            return False
-        if not self._ok(resp):
-            return False
-
-        data = self._payload(resp)
-        media_list: Any = None
-        batch_id = ""
-        if isinstance(data, dict):
-            for key in ("media_list", "media", "feed_list", "list"):
-                if isinstance(data.get(key), list):
-                    media_list = data[key]
-                    break
-            batch = data.get("batch")
-            if isinstance(batch, dict):
-                # NapCat：batch_id 可取自 batch.link_id
-                batch_id = _first(batch, ("link_id", "batch_id", "batchId"))
-        elif isinstance(data, list):
-            media_list = data
-
-        if not isinstance(media_list, list) or not media_list:
-            return False
-
-        latest = media_list[0]
-
-        # lloc 定位单张图；batch_id 定位整条说说（同批多图共用一个 batch_id）。
-        # 两者都可能埋在 QQ 原生 feed 结构里，顶层取不到就深搜一次。
-        lloc = _first(latest, _MEDIA_ID_KEYS) if isinstance(latest, dict) else ""
-        if not lloc:
-            lloc = self._deep_get(latest, _MEDIA_ID_DEEP_KEYS)
-        if not batch_id:
-            batch_id = self._deep_get(latest, _BATCH_KEYS)
-        if not lloc and not batch_id:
-            return False
-
+    async def _comment(
+        self,
+        bot: Any,
+        group_id: str,
+        album: Album,
+        text: str,
+        *,
+        batch_id: str = "",
+        lloc: str = "",
+    ) -> tuple[bool, str]:
+        """调用一次群相册评论接口，返回 (是否成功, 失败原因)"""
         payload: dict[str, Any] = {
             "group_id": str(group_id),
             "album_id": album.album_id,
             "content": text,
         }
-        # batch_id 指向整条说说，更贴合「把文案挂到这一批媒体上」的语义，
-        # 能拿到就优先用它；否则退回单张 lloc。
+        # NapCat 的 check 要求 lloc / batch_id 至少给一个；两个都给时按单张评论
         if batch_id:
             payload["batch_id"] = batch_id
-        elif lloc:
+        if lloc:
             payload["lloc"] = lloc
 
         try:
-            resp2 = await self._call(bot, "do_group_album_comment", **payload)
-        except AlbumError:
-            return False
-        # 评论接口同样可能「成功但无返回体」，按 void 语义判定
-        return self._ok(resp2, void_ok=True)
+            resp = await self._call(bot, "do_group_album_comment", **payload)
+        except AlbumError as exc:
+            return False, str(exc)
+        # 评论接口同样「成功但没有返回体」，按 void 语义判定
+        if self._ok(resp, void_ok=True):
+            return True, ""
+        return False, self._fail_reason(resp)
+
+    async def write_title(
+        self, bot: Any, group_id: str, album: Album, text: str
+    ) -> tuple[bool, str]:
+        """把作品文案写成相册里**本次上传那条说说**的评论
+
+        群相册上传接口本身没有标题/描述参数（NapCat 在底层请求里把
+        ``sPicDesc`` 固定成空串，没往外暴露），评论是唯一能把文案送进相册的
+        落点。整批图片会被合并成一条说说，因此一次调用就覆盖整批；视频各自
+        成贴，每个条目各调一次。
+
+        Returns:
+            tuple[bool, str]: 是否写入成功、失败原因（成功时为空串）。
+            调用方据此如实回执，不要再无条件打「文案：xxx」。
+        """
+        text = (text or "").strip()
+        if not text:
+            return False, "文案为空"
+
+        try:
+            targets = await self.media_targets(bot, group_id, album)
+        except AlbumError as exc:
+            return False, str(exc)
+
+        if not targets:
+            return False, "相册媒体列表里没读到可评论的条目（接口返回字段与预期不符）"
+
+        # 优先评论整条说说（batch_id），失败再退到单张图（lloc）
+        last = "没能在相册里定位到本次上传的那条媒体"
+        for index, target in enumerate(targets[:MAX_COMMENT_TARGETS]):
+            if target.batch_id:
+                ok, reason = await self._comment(
+                    bot, group_id, album, text, batch_id=target.batch_id
+                )
+                if ok:
+                    logger.info(
+                        f"[album] 文案已写入相册评论（第 {index + 1} 个候选："
+                        f"{target.describe()}）"
+                    )
+                    return True, ""
+                last = reason
+            if target.lloc:
+                ok, reason = await self._comment(
+                    bot, group_id, album, text, lloc=target.lloc
+                )
+                if ok:
+                    logger.info(
+                        f"[album] 文案已写入相册评论（第 {index + 1} 个候选："
+                        f"{target.describe()}）"
+                    )
+                    return True, ""
+                last = reason
+
+        logger.warning(
+            f"[album] 文案写入失败：{last}；本次候选 "
+            f"{[t.describe() for t in targets[:MAX_COMMENT_TARGETS]]}"
+        )
+        return False, last

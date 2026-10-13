@@ -386,8 +386,9 @@ class ParserPlugin(Star):
         report = UploadReport(album_name=album.name)
         gid = str(group_id)
 
-        # 群相册上传接口没有标题参数，文案落到相册评论上：图片整批合并成一条
-        # 说说，写一次即可；视频各自成贴，每个条目各写一次。
+        # 群相册上传接口没有标题/描述参数（NapCat 把 sPicDesc 固定成空串且没有
+        # 往外暴露），文案只能落到相册评论上：图片整批合并成一条说说，写一次即可；
+        # 视频各自成贴，每个条目各写一次。写没写成功由 write_title 如实返回。
         title = (parse_res.title or parse_res.text or "").strip()
         want_comment = bool(title) and self.cfg.album_title_comment
 
@@ -405,10 +406,12 @@ class ParserPlugin(Star):
 
         if image_paths:
             await uploader.upload_images(bot, gid, album, image_paths, report)
-            if want_comment and report.images and await uploader.write_title(
-                bot, gid, album, title
-            ):
-                report.titles += 1
+            if want_comment and report.images:
+                ok, reason = await uploader.write_title(bot, gid, album, title)
+                if ok:
+                    report.titles += 1
+                else:
+                    report.comment_errors.append(reason)
 
         # 视频体积大，逐个下载逐个传，避免一次性占满内存
         remain = max(0, capacity - len(image_paths))
@@ -431,12 +434,21 @@ class ParserPlugin(Star):
                 bot, gid, album, path, report, cover=cover
             ):
                 continue
-            if want_comment and await uploader.write_title(bot, gid, album, title):
-                report.titles += 1
+            if want_comment:
+                ok, reason = await uploader.write_title(bot, gid, album, title)
+                if ok:
+                    report.titles += 1
+                else:
+                    report.comment_errors.append(reason)
 
         lines = report.lines()
         if title:
-            lines.append(f"文案：{title[:80]}")
+            # 文案有没有真的写进相册要分开说：写成功才说「已写入」，
+            # 否则必须让用户知道点开相册看到的是「只有图、没有字」。
+            if report.titles:
+                lines.append(f"文案已写入相册评论：{title[:80]}")
+            else:
+                lines.append(f"文案未能写入相册：{title[:80]}")
         yield event.plain_result("\n".join(lines))
 
     @filter.event_message_type(filter.EventMessageType.ALL)
@@ -790,6 +802,22 @@ class ParserPlugin(Star):
                 content="",
             )
             lines.append(f"[{'通过' if ok else '失败'}] 文案写评论：{'可用' if ok else reason}")
+
+            # 实读一次媒体列表：文案能不能写进去，全看这里能不能解析出
+            # 「本次上传的那条说说」。这一步的输出是排查文案问题的一手证据。
+            try:
+                targets = await uploader.media_targets(bot, gid, album)
+            except AlbumError as e:
+                lines.append(f"[失败] 读取相册媒体列表：{e}")
+            else:
+                lines.append(f"[通过] 相册媒体列表：解析到 {len(targets)} 个可评论目标")
+                for index, target in enumerate(targets[:3], start=1):
+                    lines.append(f"  {index}. {target.describe()}")
+                if not targets:
+                    lines.append(
+                        "  说明：接口返回里没有 lloc / batch_id 字段，"
+                        "文案无法写入，请把本行所在日志发给作者"
+                    )
 
         return "\n".join(lines)
 
