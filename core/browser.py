@@ -40,6 +40,7 @@ from __future__ import annotations
 import asyncio
 import os
 import sys
+import time
 from typing import Any
 
 from astrbot.api import logger
@@ -115,6 +116,8 @@ class BrowserFetcher:
         self.last_error: str | None = None
         # 实际成功启动所用的通道（"msedge" / "chromium" / "自带 chromium"）
         self.launched_with: str | None = None
+        # 启动失败后的冷却截止时间：冷却期内直接报错，不再每次白等一次启动
+        self._retry_after: float = 0.0
 
     @staticmethod
     def available() -> bool:
@@ -178,6 +181,9 @@ class BrowserFetcher:
             if async_playwright is None:
                 self.last_error = "未安装 playwright（pip install playwright）"
                 raise RuntimeError(self.last_error)
+            # 上次启动失败后的冷却期内直接失败，避免每次请求都白等一次启动
+            if self._retry_after and time.monotonic() < self._retry_after:
+                raise RuntimeError(self.last_error or "浏览器当前不可用（冷却中）")
 
             self._pw = await async_playwright().start()
 
@@ -201,6 +207,8 @@ class BrowserFetcher:
                 await self._shutdown()
                 hint = self._launch_hint(last_err)
                 self.last_error = f"浏览器启动失败: {last_err}{hint}"
+                # 5 分钟冷却：内核没装时不要每条消息都重试一遍
+                self._retry_after = time.monotonic() + 300
                 raise RuntimeError(self.last_error)
 
             try:
@@ -226,6 +234,7 @@ class BrowserFetcher:
                 raise RuntimeError(self.last_error) from e
 
             self.last_error = None
+            self._retry_after = 0.0
             logger.info(
                 f"[browser] 抖音页面就绪（通道: {self.launched_with}），接口请求将经页面代发"
             )

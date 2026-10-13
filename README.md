@@ -119,8 +119,21 @@ python tools/verify_archive.py   # 按 AstrBot 的安装校验逻辑自检压缩
 pip install -r requirements.txt
 ```
 
-- 抖音的**浏览器兜底**需要 `playwright`。Windows / macOS 上会优先复用系统已安装的 Edge / Chrome，**无需再下载浏览器**；
-- **Linux / Docker 上只 `pip install playwright` 是不够的**，还要装浏览器内核与系统库：
+#### 抖音：需要浏览器的只有 `/全部`
+
+抖音自 2026-09 起对 PC web 详情接口启用了 Argus 风控。插件现在分两条路：
+
+| 场景 | 走的通道 | 要不要浏览器 |
+| --- | --- | --- |
+| 单条视频链接 | 分享页 SSR，失败则移动端 App 协议 | **不需要** |
+| 图文 / 实况（Live Photo）链接 | 移动端 App 协议（`aweme/v1/feed/?aweme_id=`） | **不需要** |
+| `/全部` `/全部音乐`（作者主页清单） | PC web `aweme/post` | 需要浏览器内核 |
+
+移动端协议不需要 Cookie、ttwid、a_bogus、msToken 或 secsdk 签名，普通 HTTP 即可
+（细节见 `core/parsers/douyin/mobile.py` 顶部说明）。所以**只用单条链接的话，服务器上完全不必装浏览器**。
+
+只有在用 `/全部` 时才需要 `playwright` 的内核。Windows / macOS 上会优先复用系统已安装的 Edge / Chrome，
+**无需再下载浏览器**；**Linux / Docker 上只 `pip install playwright` 是不够的**，还要装内核与系统库：
 
   ```bash
   # 一键脚本（自动识别 apt / yum / dnf，并做启动冒烟测试）
@@ -141,8 +154,8 @@ pip install -r requirements.txt
   > `tools/setup_browser.sh` 已内置这些分支。
   配置项「浏览器通道」保持默认 `auto` 即可（会自动跳过 Linux 上不存在的 Edge）。
 
-**排查**：若会话里报「浏览器代发请求失败」，AstrBot 日志里会有一行 `[browser] ...` 说明真实原因
-（内核未下载 / 缺系统库 / 无法启动），按提示处理即可。
+**排查**：若 `/全部` 报「浏览器代发请求失败」，AstrBot 日志里会有一行 `[browser] ...` 说明真实原因
+（内核未下载 / 缺系统库 / 无法启动），按提示处理即可。单条链接已不再走浏览器，不会出现该报错。
 
 **一键自检 / 一键安装**（服务器上直接跑，不依赖插件模块）：
 
@@ -179,7 +192,7 @@ python tools/diagnose_douyin.py <aweme_id>      # 检查指定作品
 | `enable` | 开 | 是否启用 |
 | `use_proxy` | 关 | 是否走全局代理 |
 | `cookies` | 空 | 选填，登录态 Cookie |
-| `browser_fallback` | 开 | 接口被风控拦截时启用浏览器兜底 |
+| `browser_fallback` | 开 | 接口被风控拦截时启用浏览器兜底。**v1.8.0 起单条作品已不走浏览器**，此项实际只影响 `/全部` 主页清单 |
 | `browser_channel` | `auto` | 浏览器通道。`auto`=按平台自动选（Linux: chrome→chromium→内置）；可填 `msedge`/`chrome`/`chromium`，或 `executable:/usr/bin/google-chrome`；也支持环境变量 `WANNENG_BROWSER_CHANNEL` |
 | `browser_headless` | 开 | 无头模式运行浏览器 |
 | `browser_idle_timeout` | 300 | 浏览器空闲多少秒后自动关闭 |
@@ -291,7 +304,7 @@ Linux 服务器上直接跑 `python tools/diagnose_douyin.py --install`（一条
 **Ubuntu 服务器本来就没有浏览器**，不需要装桌面 Chrome；playwright 会下载自己的 Chromium。
 
 **Q：实况图只发了静态图？**
-A：确认作品本身带实况；快手（含极速版）暂不支持取实况视频。抖音实况依赖详情接口，若浏览器兜底未生效也会退化为静态图。
+A：v1.8.0 起实况直链改由移动端 App 协议下发（不再依赖浏览器）。确认作品本身带实况；快手（含极速版）暂不支持取实况视频。若仍只有静态图，看日志里有没有 `[抖音] 实况直链获取失败` 的 warning。
 
 **Q：多个机器人在同一个群里重复解析？**
 A：插件内置贴表情仲裁，会在多个 Bot 之间自动选出唯一一个来解析。

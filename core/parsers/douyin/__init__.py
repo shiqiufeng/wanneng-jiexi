@@ -24,6 +24,8 @@ from ..base import (
     handle,
 )
 from .abogus import build_abogus_url
+from . import mobile
+from .mobile import fetch_aweme as fetch_mobile_aweme
 from .video import RouterData, parse_song_title
 
 
@@ -130,11 +132,76 @@ class DouyinParser(BaseParser):
         share_url = self._build_iesdouyin_url(ty, vid)
         logger.debug(f"[抖音] 使用 canonical share 页解析: {share_url}")
 
+        result: "ParseResult | None" = None
         try:
-            return await self.parse_video(share_url, vid)
+            result = await self.parse_video(share_url, vid)
         except ParseException as e:
             logger.warning(f"[抖音] canonical share 页解析失败 {share_url}, 错误: {e}")
-            raise ParseException("分享已删除或资源直链提取失败, 请稍后再试") from e
+
+        if result is not None and result.contents:
+            return result
+
+        # 分享页拿不到内容（空壳 HTML / 被风控）时，改走移动端 App 协议：
+        # 免 Cookie、免签名、免浏览器，且能拿到实况(Live Photo) mp4 直链
+        if mobile_result := await self.parse_mobile(vid):
+            logger.info(f"[抖音] 分享页不可用，已改用移动端协议解析 {vid}")
+            return mobile_result
+
+        raise ParseException("分享已删除或资源直链提取失败, 请稍后再试")
+
+    async def parse_mobile(self, aweme_id: str) -> ParseResult | None:
+        """纯移动端协议解析单条作品（视频 / 图文 / 实况通吃，全程不用浏览器）
+
+        实况直链就在 ``images[].video.bit_rate[].play_addr`` 里，因此「有实况的图
+        直接发实况 mp4、其余发静态图」，与分享页路线的行为保持一致。
+        """
+        aweme = await self._fetch_aweme_mobile(aweme_id)
+        if not aweme:
+            return None
+
+        contents: list[MediaContent] = []
+        if mobile.is_image_post(aweme):
+            static_urls = mobile.image_urls(aweme)
+            for index, image in enumerate(mobile.images(aweme)):
+                if live := mobile.live_url(image):
+                    contents.extend(
+                        self.create_dynamic_contents([live], headers=self.media_headers)
+                    )
+                elif index < len(static_urls) and static_urls[index]:
+                    contents.extend(
+                        self.create_image_contents(
+                            [static_urls[index]], headers=self.media_headers
+                        )
+                    )
+        elif url := mobile.video_url(aweme):
+            contents.append(
+                self.create_video_content(
+                    url,
+                    mobile.cover_url(aweme),
+                    mobile.duration(aweme),
+                    headers=self.media_headers,
+                )
+            )
+
+        if not contents:
+            logger.warning(f"[抖音] 移动端协议未取到可用媒体: {aweme_id}")
+            return None
+
+        author = self.create_author(
+            mobile.author_name(aweme),
+            mobile.author_avatar(aweme),
+            headers=self.ios_headers,
+        )
+        return self.result(
+            title=mobile.desc(aweme),
+            author=author,
+            contents=contents,
+            timestamp=mobile.create_time(aweme),
+            extra={
+                "song_title": mobile.song_title(aweme, parse_song_title),
+                "aweme_id": aweme_id,
+            },
+        )
 
     @staticmethod
     def _build_iesdouyin_url(ty: str, vid: str) -> str:
@@ -454,6 +521,11 @@ class DouyinParser(BaseParser):
     async def parse_slides(self, video_id: str):
         slides_data = await self._fetch_slides_detail(video_id)
         if slides_data is None:
+            # slidesinfo 只服务「纯幻灯片」作品，普通图文/实况会返回 filter_list；
+            # 这类作品改走移动端 App 协议，同样不需要浏览器
+            if mobile_result := await self.parse_mobile(video_id):
+                logger.info(f"[抖音] slidesinfo 未收录，已改用移动端协议解析 {video_id}")
+                return mobile_result
             raise ParseException("slidesinfo 接口未返回作品数据")
         logger.debug(
             f"[抖音] 幻灯片解析成功 - 作者: {slides_data.name}, 描述: {slides_data.desc[:50]}..."
@@ -647,7 +719,9 @@ class DouyinParser(BaseParser):
         """
         if not self.browser.available():
             raise ParseException(
-                "抖音接口被风控拦截，且当前环境未安装 playwright，无法启用浏览器兜底"
+                "抖音接口被风控拦截，且当前环境未安装 playwright，无法启用浏览器兜底。"
+                "「/全部」主页作品清单目前仍只能靠浏览器代发（单条作品链接已改为免浏览器）；"
+                "如需该功能请执行 python -m playwright install --with-deps chromium"
             )
 
         url = f"{endpoint}?{urlencode(params, safe='')}"
@@ -663,7 +737,29 @@ class DouyinParser(BaseParser):
         return body
 
     async def _fetch_aweme_detail(self, aweme_id: str) -> dict | None:
-        """查作品详情，返回 aweme_detail"""
+        """查作品详情
+
+        **优先走移动端 App 协议**（免 Cookie、免签名、免浏览器）——实况 mp4 直链
+        就在返回的 ``images[].video`` 里（见 mobile.py 的实测说明）。只有在移动端
+        也取不到时，才退回 PC web 详情接口，那条路被 Argus 风控，需要浏览器代发。
+        """
+        if detail := await self._fetch_aweme_mobile(aweme_id):
+            return detail
+        return await self._fetch_aweme_web(aweme_id)
+
+    async def _fetch_aweme_mobile(self, aweme_id: str) -> dict | None:
+        """移动端 feed 协议取作品详情（免浏览器）"""
+        try:
+            aweme = await fetch_mobile_aweme(self.session, aweme_id)
+        except Exception as e:  # noqa: BLE001 - 取不到就走 web 兜底
+            logger.debug(f"[抖音] 移动端详情接口异常: {e}")
+            return None
+        if aweme:
+            logger.debug(f"[抖音] 移动端协议命中作品详情: {aweme_id}")
+        return aweme
+
+    async def _fetch_aweme_web(self, aweme_id: str) -> dict | None:
+        """PC web 详情接口（被 Argus 风控，需要浏览器代发签名）"""
         body = await self._request_web_api(
             self.DETAIL_URL,
             self._build_detail_params(aweme_id),

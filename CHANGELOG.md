@@ -1,5 +1,57 @@
 # 更新日志
 
+## v1.8.0
+
+> **单条作品（视频 / 图文 / 实况）不再需要浏览器。**
+> 只有 `/全部` 主页作品清单仍受平台风控限制、依赖浏览器内核。
+
+### 修复
+
+- **实况图只发静态图 / 普通视频取不到直链**：PC web 详情接口被 Argus 风控封死后，
+  实况 mp4 直链曾只能靠浏览器代发获取。现改走**移动端 App 推荐流协议**：
+
+  ```
+  GET https://api5-normal-c-hl.amemv.com/aweme/v1/feed/?aweme_id=<id>&aid=6383
+  User-Agent: com.ss.android.ugc.aweme/300500 (Linux; U; Android 13; zh_CN; ...)
+  ```
+
+  实测该通道**不需要 Cookie、不需要 ttwid / a_bogus / msToken / secsdk 签名**，
+  HTTP 200 且 `aweme_list` 中恰好包含被请求的那条作品，字段完整：
+
+  | 需要的字段 | 位置 |
+  | --- | --- |
+  | 实况（Live Photo）mp4 | `images[].video.bit_rate[].play_addr.url_list` |
+  | 无水印视频 mp4 | `video.bit_rate[].play_addr.url_list`（按 `is_h265==0` + 码率挑档） |
+  | 静态图原图 | `images[].url_list` 末项 |
+  | 封面 / 作者 / 头像 / 音乐 / 发布时间 | `video.cover`、`author`、`music`、`create_time` |
+
+  → 新增 `core/parsers/douyin/mobile.py`，`/全部` 之外的所有抖音解析链路都不再碰浏览器。
+
+### 变更
+
+- `_fetch_aweme_detail()` 改为**移动端协议优先**：命中即返回；移动端取不到时才回退
+  PC web 详情接口（那条路才需要浏览器代发签名）。实况直链的来源随之从「浏览器」
+  换成「移动端协议」。
+- 图文 / 视频分享页解析失败（`_ROUTER_DATA` 空壳）时自动改走移动端协议，
+  不再直接报「分享已删除或资源直链提取失败」。
+- `slidesinfo` 未收录的作品（`filter_list` 里的普通图文/实况）同样改走移动端协议，
+  不再直接抛「slidesinfo 接口未返回作品数据」。
+- 浏览器启动失败后进入 **5 分钟冷却**，避免每条消息都白等一次启动。
+
+### 修复（细节）
+
+- 图集静态图优先避开 `p3-pc-sign.douyinpic.com`（实测该节点对部分资源返回 403，
+  同路径的 `p9` / `p6` / `p11` 节点正常）。
+- `mobile.video_url()` 会过滤掉背景音乐（`.mp3` / `ies-music`），避免图文作品
+  误把原声 mp3 当成视频直链。
+
+### 已知限制
+
+- `/全部` / `/全部音乐` 需要作者主页作品清单，接口 `aweme/v1/web/aweme/post/` 与
+  `iesdouyin web/api/v2/aweme/post/`（`shark_fail_1`）目前都取不到，
+  **仍必须安装浏览器内核**（`python -m playwright install --with-deps chromium`）。
+  未安装时会给出一条说明清楚的报错，而不是笼统的失败。
+
 ## v1.7.3
 
 ### 修复
