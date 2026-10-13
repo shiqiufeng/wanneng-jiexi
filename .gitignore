@@ -1,0 +1,11 @@
+__pycache__/
+core/test/
+
+# 本地环境与产出目录
+/dist/
+/outputs/
+/_dshprobe/
+/_fixprobe/
+/.workbuddy/
+/.idea/
+/.vscode/
