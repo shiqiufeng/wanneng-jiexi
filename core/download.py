@@ -75,6 +75,10 @@ class Downloader:
         self.client = ClientSession(
             timeout=ClientTimeout(total=self.cfg.download_timeout)
         )
+        # 浏览器代发通道（可选）：被风控的机器上，直连下载会被 CDN 拒（403），
+        # 只有注入了它才会在 HTTP 全失败时用页面把图片取回来。默认不注入，
+        # 因此未启用浏览器的部署行为完全不变。
+        self.browser_fetcher: Any | None = None
 
     async def close(self):
         """关闭网络客户端"""
@@ -89,6 +93,7 @@ class Downloader:
         headers: dict[str, str] | None = None,
         proxy: str | None | object = ...,
         fallback_urls: list[str] | None = None,
+        browser_fallback: bool = False,
     ) -> Path:
         """流式下载
 
@@ -99,6 +104,10 @@ class Downloader:
             proxy: 代理
             fallback_urls: 备用直链。主选直链重试耗尽后依次尝试（抖音等平台
                 的 ``url_list`` 会同时给多个等价节点，个别节点会 403）
+            browser_fallback: 所有 HTTP 候选都失败时，是否用浏览器页面代发再
+                试一次。仅当 ``self.browser_fetcher`` 已注入时才有意义 ——
+                风控是按出口 IP 拦的，换直链、换请求头都没用，只有页面里发
+                请求才带得上正确的 Cookie / Referer / TLS 指纹。
         """
         if not file_name:
             file_name = generate_file_name(url)
@@ -178,10 +187,31 @@ class Downloader:
                             f"[下载] 主选直链失败（{exc}），改用备用直链第 {index + 1} 条"
                         )
                         break
+                    # 候选已用尽：先记日志，收尾统一抛（留出浏览器代发这条退路）
                     logger.exception(f"下载失败 | url: {candidate}, file_path: {file_path}")
-                    raise DownloadException("媒体下载失败") from exc
+                    break
+
+        # 直连全线失败：换条链路再试一次（浏览器代发）
+        if browser_fallback and self.browser_fetcher is not None:
+            raw = await self._fetch_bytes_by_browser(url)
+            if raw:
+                async with aiofiles.open(file_path, "wb") as file:
+                    await file.write(raw)
+                logger.info(f"[下载] 经浏览器代发取回：{url[:120]}")
+                return file_path
 
         raise DownloadException("媒体下载失败") from last_exc
+
+    async def _fetch_bytes_by_browser(self, url: str) -> bytes | None:
+        """用浏览器页面把直链的字节取回来（取不到返回 None，不抛）"""
+        fetcher = self.browser_fetcher
+        if fetcher is None:
+            return None
+        try:
+            return await fetcher.fetch_bytes(url)
+        except Exception as e:  # noqa: BLE001 - 兜底链路的失败不该盖掉主链路报错
+            logger.warning(f"[下载] 浏览器代发失败：{e}")
+            return None
 
     @staticmethod
     def get_progress_bar(desc: str, total: int | None = None) -> tqdm:
@@ -273,7 +303,15 @@ class Downloader:
         headers: dict[str, str] | None = None,
         proxy: str | None | object = ...,
         fallback_urls: list[str] | None = None,
+        browser_fallback: bool = True,
     ) -> Path:
+        """下载图片
+
+        Args:
+            browser_fallback: 图片体积小（封面/头像/图集），直连被 CDN 拒时
+                用浏览器页面代发兜底是划算的，所以这里默认开。视频不默认开 ——
+                把几十 MB 塞进 base64 回传太贵。
+        """
         if img_name is None:
             img_name = generate_file_name(url, ".jpg")
         return await self.streamd(
@@ -282,6 +320,7 @@ class Downloader:
             headers=headers,
             proxy=proxy,
             fallback_urls=fallback_urls,
+            browser_fallback=browser_fallback,
         )
 
     async def download_imgs_without_raise(

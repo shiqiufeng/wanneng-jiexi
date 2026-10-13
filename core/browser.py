@@ -38,6 +38,7 @@ Linux 上没有 Edge，所以默认不再白试一次 ``msedge``。如果服务�
 from __future__ import annotations
 
 import asyncio
+import base64
 import os
 import sys
 import time
@@ -71,6 +72,39 @@ _XHR_SCRIPT = """
         x.send();
     } catch (e) {
         resolve({ status: -3, text: String(e) });
+    }
+})
+"""
+
+# 在页面上下文里取二进制（封面 / 图片直链）。用的同样是 XHR —— secsdk hook 的
+# 就是它，签名会自动补上；这里额外把 ArrayBuffer 编成 base64 再回传，
+# 因为 page.evaluate 只能带回可 JSON 序列化的值。
+_XHR_BYTES_SCRIPT = """
+(args) => new Promise((resolve) => {
+    try {
+        const x = new XMLHttpRequest();
+        x.open('GET', args.url, true);
+        x.responseType = 'arraybuffer';
+        x.withCredentials = true;
+        x.timeout = args.timeout * 1000;
+        x.onreadystatechange = () => {
+            if (x.readyState !== 4) return;
+            if (x.status !== 200) { resolve({ status: x.status, b64: '' }); return; }
+            const bytes = new Uint8Array(x.response || new ArrayBuffer(0));
+            // 分块拼字符串，避免大图一次性 apply 把页面卡住
+            let binary = '';
+            const CHUNK = 0x8000;
+            for (let i = 0; i < bytes.length; i += CHUNK) {
+                binary += String.fromCharCode.apply(
+                    null, bytes.subarray(i, i + CHUNK));
+            }
+            resolve({ status: x.status, b64: btoa(binary) });
+        };
+        x.onerror = () => resolve({ status: -1, b64: '' });
+        x.ontimeout = () => resolve({ status: -2, b64: '' });
+        x.send();
+    } catch (e) {
+        resolve({ status: -3, b64: String(e) });
     }
 })
 """
@@ -353,3 +387,127 @@ class BrowserFetcher:
             return None
         self.last_error = None
         return body if isinstance(body, dict) else None
+
+    async def fetch_bytes(
+        self, url: str, *, timeout: int = 30, max_bytes: int = 20 * 1024 * 1024
+    ) -> bytes | None:
+        """经浏览器代发 GET 并取回**二进制**（封面 / 图片直链）
+
+        为什么需要它：被风控的机器上不光 `/aweme/v1/web/...` 接口 403，图片 CDN
+        （`p*-sign.douyinpic.com`）也会对带签名的封面直链返回 403 —— 表现为
+        「作品解析出来了、卡片一张都渲染不出来」。实测同一条 URL 在未风控的出口
+        上直连是 200（换 UA / 加 Referer 也都是 200），所以既不是链接过期也不是
+        请求头写错，**只能换一条带得上浏览器会话的链路**。
+
+        两条取图路径，按顺序试：
+
+        1. ``page.request`` —— 与浏览器**共享 Cookie**，且请求由 Playwright 自己
+           发出，**不受同源策略限制**（图片 CDN 与页面不同源，页面内 XHR 会被
+           CORS 挡掉，这条不会）；
+        2. 页面内 XHR —— secsdk 会 hook 它补签名，代价是要过同源策略。
+
+        Args:
+            url: 图片直链
+            timeout: 单次取图的超时秒数
+            max_bytes: 体积上限，超过就放弃（别把整段视频塞进 base64）
+
+        Returns:
+            bytes | None: 取到的字节；失败返回 None
+        """
+        try:
+            page = await self._ensure_page()
+        except Exception as e:  # noqa: BLE001
+            logger.warning(f"[browser] 页面不可用: {e}")
+            return None
+
+        raw = await self._bytes_via_request_context(page, url, timeout, max_bytes)
+        if raw is None:
+            # 退到页面内 XHR：secsdk 会 hook 它，代价是要过同源策略
+            raw = await self._bytes_via_xhr(page, url, timeout)
+        self._schedule_idle_close()
+
+        if raw is None:
+            return None
+        if len(raw) > max_bytes:
+            logger.warning(
+                f"[browser] 取到的图片 {len(raw) / 1024 / 1024:.1f}MB 超过上限，放弃"
+            )
+            self.last_error = "图片体积超过上限"
+            return None
+        self.last_error = None
+        logger.info(f"[browser] 经页面取图成功：{len(raw)} 字节 | {url[:80]}")
+        return raw
+
+    async def _bytes_via_request_context(
+        self, page: Any, url: str, timeout: int, max_bytes: int
+    ) -> bytes | None:
+        """用 ``page.request`` 取图
+
+        它是 Playwright 挂在页面上的请求上下文：**与浏览器共享 Cookie**，但
+        请求由 Playwright 自己发出，因此**不受同源策略限制** —— 这一点很关键，
+        图片 CDN（``p*-sign.douyinpic.com``）与页面（``www.douyin.com``）不同源，
+        页面内 XHR 会被 CORS 挡掉，而这条不会。
+        """
+        try:
+            resp = await page.request.get(
+                url,
+                headers={"Referer": self.HOME},
+                timeout=timeout * 1000,
+            )
+        except Exception as e:  # noqa: BLE001
+            logger.warning(f"[browser] 页面请求上下文取图失败: {e}")
+            return None
+        try:
+            if resp.status != 200:
+                logger.warning(f"[browser] 页面请求上下文返回状态 {resp.status}")
+                return None
+            return await resp.body()
+        except Exception as e:  # noqa: BLE001
+            logger.warning(f"[browser] 读取图片响应体失败: {e}")
+            return None
+        finally:
+            try:
+                await resp.dispose()
+            except Exception:  # noqa: BLE001
+                pass
+
+    async def _bytes_via_xhr(self, page: Any, url: str, timeout: int) -> bytes | None:
+        """用页面内 XHR 取图（cecsdk 会补签名，但要过同源策略）"""
+        try:
+            result = await asyncio.wait_for(
+                page.evaluate(_XHR_BYTES_SCRIPT, {"url": url, "timeout": timeout}),
+                timeout=timeout + 15,
+            )
+        except Exception as e:  # noqa: BLE001
+            logger.warning(f"[browser] 页面内取图异常: {e}")
+            self.last_error = f"页面内取图异常: {e}"
+            await self.close()
+            return None
+
+        status = int(result.get("status") or 0)
+        b64 = result.get("b64") or ""
+        if status != 200 or not b64:
+            logger.warning(f"[browser] 页面内取图返回状态 {status}: {url[:90]}")
+            self.last_error = f"页面内取图返回状态 {status}"
+            return None
+
+        try:
+            return base64.b64decode(b64)
+        except Exception as e:  # noqa: BLE001
+            logger.warning(f"[browser] 取图结果解码失败: {e}")
+            self.last_error = "取图结果解码失败"
+            return None
+
+        if len(raw) > max_bytes:
+            logger.warning(
+                f"[browser] 取到的图片 {len(raw) / 1024 / 1024:.1f}MB 超过上限，放弃"
+            )
+            self.last_error = "图片体积超过上限"
+            return None
+        if not raw:
+            self.last_error = "取到的图片为空"
+            return None
+
+        self.last_error = None
+        logger.info(f"[browser] 经页面取图成功：{len(raw)} 字节 | {url[:80]}")
+        return raw

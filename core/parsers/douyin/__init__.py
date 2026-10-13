@@ -59,6 +59,10 @@ class DouyinParser(BaseParser):
             channel=self.mycfg.browser_channel or "auto",
             idle_timeout=int(self.mycfg.browser_idle_timeout or 300),
         )
+        if self.browser_fallback:
+            # 把浏览器通道交给下载器：被风控的机器上图片 CDN 同样 403
+            # （接口走 get_json 代发，图片下载得走 fetch_bytes 代发，是两条路）
+            self.downloader.browser_fetcher = self.browser
 
     async def close_session(self) -> None:
         """关闭解析器时一并释放浏览器"""

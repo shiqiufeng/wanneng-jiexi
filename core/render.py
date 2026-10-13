@@ -739,7 +739,12 @@ class Renderer:
         img_count = len(img_contents)
 
         for img_content in img_contents:
-            img_path = await img_content.get_path()
+            try:
+                img_path = await img_content.get_path()
+            except Exception as e:  # noqa: BLE001
+                # 单张图下不来不该让整个九宫格（乃至于整张卡片）消失
+                logger.warning(f"图集里有一张图下载失败，跳过：{e}")
+                continue
             # 使用装饰器保护的方法，失败会返回 None
             img = await self._load_and_process_grid_image(
                 img_path, content_width, img_count

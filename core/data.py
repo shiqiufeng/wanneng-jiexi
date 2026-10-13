@@ -5,6 +5,8 @@ from datetime import datetime
 from pathlib import Path
 from typing import Any, TypedDict
 
+from astrbot.api import logger
+
 
 def repr_path_task(path_task: Path | Task[Path]) -> str:
     if isinstance(path_task, Path):
@@ -53,11 +55,24 @@ class VideoContent(MediaContent):
     """时长 单位: 秒"""
 
     async def get_cover_path(self) -> Path | None:
+        """取封面路径；下载失败返回 None 而不是抛
+
+        封面只是卡片的配图：它 403 了（被风控的机器上图片 CDN 会拒整个出口 IP），
+        卡片照样该渲染出来 —— 早期这里是直接 await Task，封面一下载失败就把整张
+        卡片连带标题、作者、链接一起丢掉，表现就是「/全部 10 条只回来几条甚至
+        一条都没有」。发送媒体那条路（:meth:`get_path`）仍然照常抛，因为媒体本身
+        就是用户要的东西，静默丢掉更糟。
+        """
         if self.cover is None:
             return None
         if isinstance(self.cover, Path):
             return self.cover
-        self.cover = await self.cover
+        try:
+            self.cover = await self.cover
+        except Exception as e:  # noqa: BLE001
+            logger.warning(f"封面下载失败，卡片按无封面渲染：{e}")
+            self.cover = None
+            return None
         return self.cover
 
     @property
@@ -144,11 +159,17 @@ class Author:
     """作者个性签名等"""
 
     async def get_avatar_path(self) -> Path | None:
+        """取头像路径；下载失败返回 None 而不是抛（同 :meth:`VideoContent.get_cover_path`）"""
         if self.avatar is None:
             return None
         if isinstance(self.avatar, Path):
             return self.avatar
-        self.avatar = await self.avatar
+        try:
+            self.avatar = await self.avatar
+        except Exception as e:  # noqa: BLE001
+            logger.warning(f"头像下载失败，卡片按无头像渲染：{e}")
+            self.avatar = None
+            return None
         return self.avatar
 
     def __repr__(self) -> str:

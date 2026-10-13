@@ -1,3 +1,4 @@
+import asyncio
 from itertools import chain
 from pathlib import Path
 
@@ -410,10 +411,20 @@ class MessageSender:
         """
         nodes = Nodes([])
         self_id = event.get_self_id()
+        rendered: list[tuple[ParseResult, Path | None]] = []
 
         for card in cards:
+            image_path = await self.renderer.render_card(card)
+            if image_path is not None:
+                try:
+                    size_mb = image_path.stat().st_size / 1024 / 1024
+                except OSError:
+                    size_mb = 0.0
+                logger.debug(f"[sender] 卡片 {size_mb:.2f}MB | {image_path.name}")
+            rendered.append((card, image_path))
+
             content: list[BaseMessageComponent] = []
-            if image_path := await self.renderer.render_card(card):
+            if image_path:
                 content.append(self._image_from_path(image_path))
             if card.url:
                 content.append(Plain(card.url))
@@ -428,8 +439,68 @@ class MessageSender:
 
         try:
             await event.send(event.chain_result([nodes]))
+            return
         except Exception as e:
-            logger.error(f"发送作品卡片失败： error={e}, nodes={len(nodes.nodes)}")
+            # 合并转发要在协议端把节点里的图片全部上传一遍，任一环节失败就整包
+            # 失败（NapCat 表现为「上传转发消息资源失败：x/x」）。以前这里只记
+            # 一行日志，用户什么都没收到；现在退到逐条发送，能发几条是几条。
+            logger.error(
+                f"合并转发发送失败（{e}），改为逐条发送，共 {len(rendered)} 条"
+            )
+
+        await self._send_cards_one_by_one(event, rendered)
+
+    async def _send_cards_one_by_one(
+        self,
+        event: AstrMessageEvent,
+        rendered: list[tuple[ParseResult, Path | None]],
+    ):
+        """逐条发送作品卡片：图片发不出去时至少留下标题与链接
+
+        合并转发失败后的兜底。每张卡片单独发一条（图片 + 链接）；单条也失败
+        （多半还是图片上传不过去）就只发文字，保证信息不整批丢失。
+        """
+        sent = 0
+        for index, (card, image_path) in enumerate(rendered, start=1):
+            segs: list[BaseMessageComponent] = []
+            if image_path:
+                segs.append(self._image_from_path(image_path))
+            if card.url:
+                segs.append(Plain(card.url))
+            if segs:
+                try:
+                    await event.send(event.chain_result(segs))
+                    sent += 1
+                    continue
+                except Exception as e:  # noqa: BLE001
+                    logger.warning(f"逐条发送第 {index} 条失败（{e}），降级为纯文字")
+
+            text = self._card_text(card)
+            if not text:
+                continue
+            try:
+                await event.send(event.chain_result([Plain(text)]))
+                sent += 1
+            except Exception as e:  # noqa: BLE001
+                logger.error(f"第 {index} 条纯文字兜底也失败：{e}")
+
+            if index < len(rendered):
+                await asyncio.sleep(0.6)  # 别把协议端打急了
+
+        if not sent:
+            logger.error(f"作品卡片 {len(rendered)} 条全部发送失败，已尽力")
+
+    @staticmethod
+    def _card_text(card: ParseResult) -> str:
+        """卡片发不出去时的文字形态：标题 + 作者 + 链接"""
+        bits: list[str] = []
+        if card.author and card.author.name:
+            bits.append(f"@{card.author.name}")
+        if card.title:
+            bits.append(card.title)
+        if card.url:
+            bits.append(card.url)
+        return " ".join(bits)
 
     async def send_parse_result(
         self,
