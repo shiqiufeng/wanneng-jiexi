@@ -11,16 +11,18 @@ DIVIDER = "━━━━━━━━━━━━━━━━"
 HEADER = f"📖 万能解析 · 使用帮助\n{DIVIDER}"
 
 
-def build_help(platforms: list[str]) -> str:
+def build_help(platforms: list[str], album_name: str = "") -> str:
     """拼装帮助文本
 
     Args:
         platforms (list[str]): 当前已启用的平台显示名称，按启用顺序传入
+        album_name (str): 群相册名，用于「/相册少女集」的说明文案
 
     Returns:
         str: 可直接发送的纯文本帮助
     """
     platform_line = "、".join(platforms) if platforms else "（当前无已启用平台，请在配置面板开启）"
+    album_label = album_name or "少女集"
 
     return "\n".join(
         [
@@ -37,9 +39,11 @@ def build_help(platforms: list[str]) -> str:
             "/音乐 <链接>            仅解析音频，只发音频不发视频",
             "/全部 <主页链接>        抖音主页作品清单（卡片 + 作品直链）",
             "/全部音乐 <主页链接>    抖音主页音乐清单（音频直链文本）",
+            f"/相册{album_label} <链接>      解析后直接存进群相册「{album_label}」，不发到会话",
             "/开启解析               开启当前会话的解析（管理员）",
             "/关闭解析               关闭当前会话的解析（管理员）",
             "/短链验证               自检短链服务是否可用（管理员）",
+            "/相册自检               检查群相册是否就绪（管理员）",
             "/登录B站                扫码登录 B 站（管理员）",
             "/解析帮助               显示本帮助",
             "",
@@ -51,6 +55,11 @@ def build_help(platforms: list[str]) -> str:
             "【实况说明】",
             "抖音、小红书、TikTok 的实况图会以 mp4 发送，并替代对应的静态图；",
             "分段作品的实况与静态图各归其位。快手图集暂只发静态图。",
+            "",
+            "【群相册】",
+            f"「/相册{album_label} + 链接」把解析出的图片和视频存进群相册「{album_label}」，",
+            "只回一条上传结果，不往群里发媒体本身。相册要先在群里建好，不会自动创建。",
+            "作品文案会写到相册评论里（群相册接口没有标题参数）。",
             "",
             "【小提示】",
             "· 音频文件名形如「作者_歌名.mp3」，便于区分",

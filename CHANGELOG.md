@@ -1,5 +1,34 @@
 # 更新日志
 
+## v1.8.1
+
+> 新增 **`/相册少女集`**：解析出来的图片和视频直接存进 QQ 群相册，不再往群里刷屏。
+
+### 新增
+
+- **`/相册少女集 <链接>`**：先解析链接，再把图片和视频上传到群相册「少女集」
+  （相册名见配置项「相册名称」），只在群里回一条上传结果。
+  - 图片走 `upload_images_to_qun_album` 一次性上传（相册里显示为同一条）；
+    旧版 NapCat 没有该接口时自动降级为逐张 `upload_image_to_qun_album`。
+  - 视频走 `upload_video_to_qun_album`（封面自动抽首帧）；旧版 NapCat 没有该接口时
+    自动降级为上传视频封面图，没有封面则明确报失败原因。
+  - 抖音图文实况：静态图按图片上传，实况 mp4 按视频上传。
+  - **文案写到相册评论**：群相册上传接口本身没有标题参数，改用
+    `do_group_album_comment` 把作品文案写到相册里最新一条媒体上（可关）。
+- 新增配置项：`album_enabled`、`album_name`（默认 少女集）、`album_title_comment`、
+  `album_max_media`（默认 20）、`album_base64_fallback`。
+- 新增 `core/album.py`（上传客户端）与 `_albumprobe/test_uploader.py`（离线自测）。
+
+### 说明
+
+- 走的是 **NapCat 扩展 action**（`get_qun_album_list` 等），经 AstrBot 已经建好的
+  连接调用，**不需要额外填写 NapCat 地址与 token**。
+- 相册需要**先在群里建好**，插件不会自动创建；找不到时会把群里已有的相册名一并回出来。
+- `upload_images_to_qun_album` / `upload_video_to_qun_album` 需要 **NapCat v4.18.30+**；
+  低版本会走降级链，不会整条失败。
+- AstrBot 与 NapCat 不在同一台机器时，本地路径传不过去，会再用 base64 试一次
+  （仅对小于 24 MB 的文件生效）。
+
 ## v1.8.0
 
 > **单条作品（视频 / 图文 / 实况）不再需要浏览器。**

@@ -45,6 +45,7 @@ EXCLUDE_DIRS = {
     "tools",
     "_dshprobe",
     "_fixprobe",
+    "_albumprobe",
     ".workbuddy",
     ".pytest_cache",
     ".mypy_cache",

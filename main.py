@@ -15,10 +15,19 @@ from astrbot.core.platform.sources.aiocqhttp.aiocqhttp_message_event import (
     AiocqhttpMessageEvent,
 )
 
+from .core.album import AlbumError, GroupAlbumUploader, UploadReport
 from .core.arbiter import ArbiterContext, EmojiLikeArbiter
 from .core.clean import CacheCleaner
 from .core.config import PluginConfig
-from .core.data import AudioContent, DynamicContent, ParseResult, VideoContent
+from .core.data import (
+    AudioContent,
+    DynamicContent,
+    GraphicsContent,
+    ImageContent,
+    MediaContent,
+    ParseResult,
+    VideoContent,
+)
 from .core.debounce import Debouncer
 from .core.download import Downloader
 from .core.exception import ParseException
@@ -42,6 +51,13 @@ ALL_WORKS_PREFIX = re.compile(r"^/?全部[\s:：]*")
 
 ALL_MUSIC_PREFIX = re.compile(r"^/?全部音乐[\s:：]*")
 """主页音乐清单的触发前缀，如 "/全部音乐" 、"全部音乐" """
+
+ALBUM_PREFIX = re.compile(r"^/?相册少女集[\s:：]*")
+"""群相册上传的触发前缀，如 "/相册少女集 <链接>"
+
+解析出的图片/视频会上传到群相册（相册名见配置项「相册名称」），
+不会再往会话里发媒体本身。
+"""
 
 LIMIT_PARAM = re.compile(r"^(\d+)\s+")
 """清单条数参数，如 "/全部 10 <链接>"。要求数字后紧跟空白，
@@ -240,6 +256,113 @@ class ParserPlugin(Star):
         name = "_".join(part for part in (author, title) if part)
         return f"{sanitize_filename(name)}.mp3" if name else None
 
+    @staticmethod
+    def _collect_album_media(
+        parse_res: ParseResult,
+    ) -> tuple[list[MediaContent], list[MediaContent]]:
+        """把解析结果拆成「图片 / 视频」两组待上传媒体
+
+        图文卡片的 GraphicsContent 本身也是图片，一并算进图片组。
+        """
+        images: list[MediaContent] = []
+        videos: list[MediaContent] = []
+        for cont in parse_res.contents:
+            if isinstance(cont, (ImageContent, GraphicsContent)):
+                images.append(cont)
+            elif isinstance(cont, (VideoContent, DynamicContent)):
+                videos.append(cont)
+        return images, videos
+
+    async def _upload_to_album(self, event: AstrMessageEvent, parse_res: ParseResult):
+        """把解析结果上传到群相册，并回执结果
+
+        抖音实况：静态图按图片上传，实况 mp4 按视频上传；NapCat 版本过旧
+        没有视频接口时自动退化为上传视频封面。整个过程不往会话里发媒体。
+        """
+        if not isinstance(event, AiocqhttpMessageEvent):
+            yield event.plain_result("群相册上传仅支持 QQ（NapCat）协议端")
+            return
+
+        group_id = event.get_group_id()
+        if not group_id:
+            yield event.plain_result(
+                "请在群聊里使用「/相册少女集」，私聊无法确定相册归属"
+            )
+            return
+
+        bot = event.bot
+        uploader = GroupAlbumUploader(
+            name=self.cfg.album_name,
+            title_comment=self.cfg.album_title_comment,
+            base64_fallback=self.cfg.album_base64_fallback,
+            max_media=self.cfg.album_max_media,
+        )
+
+        try:
+            album = await uploader.find_album(bot, str(group_id))
+        except AlbumError as e:
+            yield event.plain_result(f"群相册不可用：{e}")
+            return
+
+        if album is None:
+            names = await uploader.album_names(bot, str(group_id))
+            tip = f"群里现有相册：{'、'.join(names)}" if names else "群里还没有相册"
+            yield event.plain_result(
+                f"群里没有名为「{self.cfg.album_name}」的相册，请先在群相册里创建。\n{tip}"
+            )
+            return
+
+        images, videos = self._collect_album_media(parse_res)
+        capacity = uploader.max_media
+        report = UploadReport(album_name=album.name)
+
+        # 图片：先全部下载再一次性上传（同一批在相册里显示为同一条）
+        image_paths: list[Path] = []
+        for cont in images[:capacity]:
+            try:
+                image_paths.append(await cont.get_path())
+            except Exception as e:  # noqa: BLE001 - 单个下载失败不影响其余
+                report.failures.append(f"图片下载失败：{e}")
+        if len(images) > capacity:
+            report.skipped.append(
+                f"图片超过 {capacity} 项上限，略过 {len(images) - capacity} 张"
+            )
+
+        if image_paths:
+            await uploader.upload_images(bot, str(group_id), album, image_paths, report)
+
+        # 视频体积大，逐个下载逐个传，避免一次性占满内存
+        remain = max(0, capacity - len(image_paths))
+        todo = videos[:remain]
+        if len(videos) > len(todo):
+            report.skipped.append(f"视频超过上限，略过 {len(videos) - len(todo)} 个")
+        for cont in todo:
+            try:
+                path = await cont.get_path()
+            except Exception as e:  # noqa: BLE001
+                report.failures.append(f"视频下载失败：{e}")
+                continue
+            cover = None
+            if isinstance(cont, VideoContent):
+                try:
+                    cover = await cont.get_cover_path()
+                except Exception:  # noqa: BLE001 - 封面只是兜底，拿不到就算了
+                    cover = None
+            await uploader.upload_video(
+                bot, str(group_id), album, path, report, cover=cover
+            )
+
+        # 群相册上传接口没有标题参数，文案落到相册评论上
+        title = (parse_res.title or parse_res.text or "").strip()
+        if title and report.total and self.cfg.album_title_comment:
+            if await uploader.write_title(bot, str(group_id), album, title):
+                report.titles = report.total
+
+        lines = report.lines()
+        if title:
+            lines.append(f"文案：{title[:80]}")
+        yield event.plain_result("\n".join(lines))
+
     @filter.event_message_type(filter.EventMessageType.ALL)
     async def on_message(self, event: AstrMessageEvent):
         """消息的统一入口"""
@@ -260,6 +383,12 @@ class ParserPlugin(Star):
 
         seg1 = chain[0]
         text = event.message_str
+
+        # 群相册上传："/相册少女集 <链接>" 时剥离前缀，解析后上传到群相册
+        album_upload = False
+        if self.cfg.album_enabled and (prefix := ALBUM_PREFIX.match(text)):
+            album_upload = True
+            text = text[prefix.end() :]
 
         # 仅解析音频："/音乐 <链接>" 时剥离前缀，只发送音频
         audio_only = False
@@ -361,12 +490,13 @@ class ParserPlugin(Star):
                 return
             logger.debug("Bot在仲裁中胜出, 准备解析...")
 
-        # 基于link防抖（音频模式/作品清单与普通解析是不同意图，不共用防抖）
+        # 基于link防抖（音频模式/作品清单/相册上传与普通解析是不同意图，不共用防抖）
         link = searched.group(0)
         if (
             not audio_only
             and not all_works
             and not all_music
+            and not album_upload
             and self.debouncer.hit_link(umo, link)
         ):
             logger.warning(f"[链接防抖] 链接 {link} 在防抖时间内，跳过解析")
@@ -406,8 +536,17 @@ class ParserPlugin(Star):
             resource_id = f"audio:{resource_id}"
         elif all_works:
             resource_id = f"allworks:{resource_id}"
+        elif album_upload:
+            # 相册写入有副作用，重复触发会重复上传，用独立指纹再拦一次
+            resource_id = f"album:{resource_id}"
         if not all_music and self.debouncer.hit_resource(umo, resource_id):
             logger.warning(f"[资源防抖] 资源 {resource_id} 在防抖时间内，跳过发送")
+            return
+
+        # 上传到群相册：只回执结果，不往会话里发媒体本身
+        if album_upload:
+            async for res in self._upload_to_album(event, parse_res):
+                yield res
             return
 
         # 仅发送音频
@@ -466,6 +605,80 @@ class ParserPlugin(Star):
         # 实际解析由 on_message 统一完成，此函数仅用于注册 /全部音乐 命令
         pass
 
+    @filter.command("相册少女集", alias={"相册上传"})
+    async def album_upload_parser(self, event: AstrMessageEvent):
+        """上传到群相册：/相册少女集 <链接>"""
+        # 实际解析与上传由 on_message 统一完成，此函数仅用于注册命令
+        pass
+
+    @filter.permission_type(filter.PermissionType.ADMIN)
+    @filter.command("相册自检", alias={"相册检测"})
+    async def album_selftest(self, event: AstrMessageEvent):
+        """检查群相册上传是否就绪：列出群内相册，并探测各接口是否可用"""
+        if not isinstance(event, AiocqhttpMessageEvent):
+            yield event.plain_result("相册自检仅支持 QQ（NapCat）协议端")
+            return
+
+        group_id = event.get_group_id()
+        if not group_id:
+            yield event.plain_result("请在群聊里使用「/相册自检」")
+            return
+
+        bot = event.bot
+        gid = str(group_id)
+        uploader = GroupAlbumUploader(
+            name=self.cfg.album_name,
+            title_comment=self.cfg.album_title_comment,
+            base64_fallback=self.cfg.album_base64_fallback,
+            max_media=self.cfg.album_max_media,
+        )
+        lines = [f"相册自检（群 {gid}）", f"目标相册：{self.cfg.album_name}"]
+
+        try:
+            names = await uploader.album_names(bot, gid)
+            album = await uploader.find_album(bot, gid)
+        except AlbumError as e:
+            lines.append(f"[失败] 读取群相册：{e}")
+            yield event.plain_result("\n".join(lines))
+            return
+
+        lines.append(f"[通过] 群内相册：{'、'.join(names) if names else '（空）'}")
+        if album is not None:
+            lines.append(f"[通过] 目标相册命中：{album.name}（{album.album_id}）")
+        elif names:
+            lines.append("[失败] 相册名对不上，把「相册名称」改成上面列出的名字之一")
+        else:
+            lines.append("[失败] 群里还没有相册，请先在群相册里创建一个")
+
+        # 探测各接口是否存在（只判 action 是否认得，不会真的上传）
+        if album is not None:
+            probes: tuple[tuple[str, str, dict], ...] = (
+                ("多图一次性上传", "upload_images_to_qun_album", {"files": []}),
+                ("视频上传", "upload_video_to_qun_album", {"file": ""}),
+            )
+            for label, action, extra in probes:
+                ok, reason = await uploader.probe(
+                    bot,
+                    action,
+                    group_id=gid,
+                    album_id=album.album_id,
+                    album_name=album.name,
+                    **extra,
+                )
+                lines.append(f"[{'通过' if ok else '失败'}] {label}：{'可用' if ok else reason}")
+
+            ok, reason = await uploader.probe(
+                bot,
+                "do_group_album_comment",
+                group_id=gid,
+                album_id=album.album_id,
+                lloc="",
+                content="",
+            )
+            lines.append(f"[{'通过' if ok else '失败'}] 文案写评论：{'可用' if ok else reason}")
+
+        yield event.plain_result("\n".join(lines))
+
     def _enabled_platform_names(self) -> list[str]:
         """收集已启用平台的显示名称（按注册顺序去重）"""
         seen: set[int] = set()
@@ -480,7 +693,9 @@ class ParserPlugin(Star):
     @filter.command("解析帮助", alias={"解析说明", "parserhelp"})
     async def parser_help(self, event: AstrMessageEvent):
         """查看万能解析的使用帮助"""
-        yield event.plain_result(build_help(self._enabled_platform_names()))
+        yield event.plain_result(
+            build_help(self._enabled_platform_names(), self.cfg.album_name)
+        )
 
     @filter.permission_type(filter.PermissionType.ADMIN)
     @filter.command("短链验证", alias={"短链测试"})

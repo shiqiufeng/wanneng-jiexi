@@ -100,6 +100,41 @@
         },
         "default": 50
     },
+    "album_enabled": {
+        "description": "启用相册命令",
+        "hint": "开启后可用「/相册少女集 + 链接」，把解析出的图片和视频直接上传到群相册。仅支持 QQ（NapCat）协议端",
+        "type": "bool",
+        "default": true
+    },
+    "album_name": {
+        "description": "相册名称",
+        "hint": "目标群相册的名字，需与群相册里的名字一致（不会自动创建）。「/相册少女集」上传到该相册",
+        "type": "string",
+        "default": "少女集"
+    },
+    "album_title_comment": {
+        "description": "把文案写入相册评论",
+        "hint": "群相册上传接口没有标题参数，开启后会把作品文案作为相册评论写上去（需 NapCat 支持发表群相册评论）",
+        "type": "bool",
+        "default": true
+    },
+    "album_max_media": {
+        "description": "单次上传上限",
+        "hint": "一次「/相册少女集」最多上传多少个媒体，避免超大图集把相册刷屏",
+        "type": "int",
+        "slider": {
+            "min": 1,
+            "max": 100,
+            "step": 1
+        },
+        "default": 20
+    },
+    "album_base64_fallback": {
+        "description": "base64 兜底",
+        "hint": "AstrBot 与 NapCat 不在同一台机器时本地路径传不过去；开启后改用 base64 再试一次（仅对小于 24MB 的文件生效）",
+        "type": "bool",
+        "default": true
+    },
     "shortlink_api": {
         "description": "短链服务接口地址",
         "hint": "自建短链服务(Url-Shorten-Worker，项目地址 https://github.com/crazypeace/Url-Shorten-Worker)的地址，例如 https://dl.example.com/你的密码。留空则不生成短链，「/全部音乐」会直接发送原始音频直链",

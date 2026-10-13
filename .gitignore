@@ -6,6 +6,7 @@ core/test/
 /outputs/
 /_dshprobe/
 /_fixprobe/
+/_albumprobe/
 /.workbuddy/
 /.idea/
 /.vscode/

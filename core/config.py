@@ -246,6 +246,12 @@ class PluginConfig(ConfigNode):
 
     clean_cron: str
 
+    album_enabled: bool
+    album_name: str
+    album_title_comment: bool
+    album_base64_fallback: bool
+    album_max_media: int
+
     parsers_template: list[dict[str, Any]]
 
     _plugin_name = "万能解析"
@@ -273,6 +279,10 @@ class PluginConfig(ConfigNode):
             self.audio_send_mode = "auto"
         self.voice_max_second = self.voice_max_second or 60
         self.all_works_limit = self.all_works_limit or 50
+
+        # 群相册：相册名留空时按「少女集」处理，与命令名保持一致
+        self.album_name = (self.album_name or "").strip() or "少女集"
+        self.album_max_media = self.album_max_media or 20
 
         # 短链服务(Url-Shorten-Worker)：地址与密码都填了才启用
         self.shortlink_api = (self.shortlink_api or "").strip()
