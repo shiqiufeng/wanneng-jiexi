@@ -1031,6 +1031,17 @@ class DouyinParser(BaseParser):
         """从消息文本里的抖音链接解析主页作品清单"""
         return await self.parse_user_works(await self._resolve_sec_uid(text), limit)
 
+    async def fetch_user_works_from_text(
+        self, text: str, limit: int | None = None
+    ) -> list[dict]:
+        """从消息文本里的抖音链接拉取主页作品原始条目
+
+        给「主页整批上传相册」用：不回卡片、不建短链，只要原始 aweme 条目，
+        调用方再逐条用 :meth:`parse_mobile` 取媒体。主页链接与主页分享短链都接受。
+        """
+        limit = limit or self.cfg.all_works_limit or 50
+        return await self.fetch_user_works(await self._resolve_sec_uid(text), limit)
+
     async def parse_user_music_from_text(
         self, text: str, limit: int | None = None, as_media: bool = False
     ) -> "ParseResult":

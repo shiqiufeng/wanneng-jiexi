@@ -25,6 +25,8 @@ from .core.album import (
     UploadReport,
     clean_album_name,
     split_album_command,
+    split_all_album_command,
+    upload_works_to_album,
 )
 from .core.arbiter import ArbiterContext, EmojiLikeArbiter
 from .core.clean import CacheCleaner
@@ -61,6 +63,13 @@ ALL_WORKS_PREFIX = re.compile(r"^/?全部[\s:：]*")
 
 ALL_MUSIC_PREFIX = re.compile(r"^/?全部音乐[\s:：]*")
 """主页音乐清单的触发前缀，如 "/全部音乐" 、"全部音乐" """
+
+ALL_ALBUM_MAX_WORKS = 50
+"""「/全部相册」单次最多处理多少个作品
+
+每个作品都要把媒体完整下载一遍再传上去，条数不设限会让命令跑很久；
+要更多可以调配置项「主页作品条数」，但不会超过这个上限。
+"""
 
 
 def _sender_role(event: AstrMessageEvent) -> str:
@@ -450,10 +459,37 @@ class ParserPlugin(Star):
         lines.append(f"上传用法：/相册{albums[0].name} + 链接")
         return "\n".join(lines)
 
-    async def _upload_to_album(
-        self, event: AstrMessageEvent, parse_res: ParseResult, album_name: str
-    ):
-        """把解析结果上传到指定群相册，并回执结果
+    @staticmethod
+    def _album_missing_text(album_name: str, names: list[str]) -> str:
+        """找不到目标相册时的提示（单链接上传与主页整批上传共用）"""
+        if names:
+            tip = "群里现有相册：" + "、".join(names)
+        else:
+            tip = (
+                "没有读到任何群相册，请确认：\n"
+                "· 群相册里确实已创建该相册，名称与命令里写的完全一致\n"
+                "· 协议端为 NapCat 且版本 ≥ v4.18.30"
+            )
+        return (
+            f"没有找到名为「{album_name}」的群相册。\n{tip}\n"
+            f"可以让群主/群管理员用「/创建相册{album_name}」建一个"
+            "（需协议端支持建相册，NapCat 目前未开放该接口，"
+            "这种情况下请在群相册里手动新建一次）；"
+            "管理员可用 /相册自检 查看逐项探测结果。"
+        )
+
+    async def _upload_one_to_album(
+        self,
+        bot,
+        gid: str,
+        album,
+        uploader: GroupAlbumUploader,
+        parse_res: ParseResult,
+    ) -> tuple[UploadReport, list[str]]:
+        """把**单个**解析结果上传到相册，返回（结果汇总、回执行）
+
+        刻意不 yield：单链接的「/相册」命令与主页整批上传都复用这里，批量时
+        只取汇总数字，不逐作品刷屏。
 
         抖音实况：静态图按图片上传，实况 mp4 按视频上传；NapCat 版本过旧
         没有视频接口时自动退化为上传视频封面。整个过程不往会话里发媒体。
@@ -461,54 +497,10 @@ class ParserPlugin(Star):
         图片走 NapCat 的「一次传多张」，同批共用 batchId，相册里**合并成
         一条说说**（也就是用户要的「一条装齐所有图／视频 + 文案」）；视频走
         独立的视频链路，NapCat 不支持把视频并进图片批次里，因此视频各自成贴。
-
-        Args:
-            album_name: 目标相册名，由「/相册<名字>」命令解析而来，
-                省略时是配置项「默认相册名称」
         """
-        if not isinstance(event, AiocqhttpMessageEvent):
-            yield event.plain_result("群相册上传仅支持 QQ（NapCat）协议端")
-            return
-
-        group_id = event.get_group_id()
-        if not group_id:
-            yield event.plain_result(
-                f"请在群聊里使用「/相册{album_name}」，私聊无法确定相册归属"
-            )
-            return
-
-        bot = event.bot
-        uploader = self._album_uploader(album_name)
-
-        try:
-            album = await uploader.find_album(bot, str(group_id))
-        except AlbumError as e:
-            yield event.plain_result(f"群相册不可用：{e}")
-            return
-
-        if album is None:
-            names = await uploader.album_names(bot, str(group_id))
-            if names:
-                tip = "群里现有相册：" + "、".join(names)
-            else:
-                tip = (
-                    "没有读到任何群相册，请确认：\n"
-                    "· 群相册里确实已创建该相册，名称与命令里写的完全一致\n"
-                    "· 协议端为 NapCat 且版本 ≥ v4.18.30"
-                )
-            yield event.plain_result(
-                f"没有找到名为「{album_name}」的群相册。\n{tip}\n"
-                f"可以让群主/群管理员用「/创建相册{album_name}」建一个"
-                "（需协议端支持建相册，NapCat 目前未开放该接口，"
-                "这种情况下请在群相册里手动新建一次）；"
-                "管理员可用 /相册自检 查看逐项探测结果。"
-            )
-            return
-
         images, videos = self._collect_album_media(parse_res)
         capacity = uploader.max_media
         report = UploadReport(album_name=album.name)
-        gid = str(group_id)
 
         # 群相册上传接口没有标题/描述参数（NapCat 把 sPicDesc 固定成空串且没有
         # 往外暴露），文案只能落到相册评论上：图片整批合并成一条说说，写一次即可；
@@ -573,7 +565,137 @@ class ParserPlugin(Star):
                 lines.append(f"文案已写入相册评论：{title[:80]}")
             else:
                 lines.append(f"文案未能写入相册：{title[:80]}")
+        return report, lines
+
+    async def _upload_to_album(
+        self, event: AstrMessageEvent, parse_res: ParseResult, album_name: str
+    ):
+        """把单个链接的解析结果上传到指定群相册，并回执结果
+
+        Args:
+            album_name: 目标相册名，由「/相册<名字>」命令解析而来，
+                省略时是配置项「默认相册名称」
+        """
+        if not isinstance(event, AiocqhttpMessageEvent):
+            yield event.plain_result("群相册上传仅支持 QQ（NapCat）协议端")
+            return
+
+        group_id = event.get_group_id()
+        if not group_id:
+            yield event.plain_result(
+                f"请在群聊里使用「/相册{album_name}」，私聊无法确定相册归属"
+            )
+            return
+
+        bot = event.bot
+        gid = str(group_id)
+        uploader = self._album_uploader(album_name)
+
+        try:
+            album = await uploader.find_album(bot, gid)
+        except AlbumError as e:
+            yield event.plain_result(f"群相册不可用：{e}")
+            return
+
+        if album is None:
+            yield event.plain_result(
+                self._album_missing_text(album_name, await uploader.album_names(bot, gid))
+            )
+            return
+
+        _report, lines = await self._upload_one_to_album(
+            bot, gid, album, uploader, parse_res
+        )
         yield event.plain_result("\n".join(lines))
+
+    async def _upload_all_to_album(
+        self,
+        event: AstrMessageEvent,
+        album_name: str,
+        text: str,
+        limit: int | None = None,
+    ):
+        """主页整批上传：「/全部相册<名字> <主页链接>」
+
+        逐个作品解析后上传到同一个相册，**每个作品在相册里各自成一条**
+        （同一作品的多张图片合并成一条说说；视频受 NapCat 协议限制各自成贴）。
+
+        媒体要逐个下载上传，耗时较长，因此只在开头与结尾各回一条，不逐作品刷屏。
+        """
+        if not isinstance(event, AiocqhttpMessageEvent):
+            yield event.plain_result("群相册上传仅支持 QQ（NapCat）协议端")
+            return
+
+        group_id = event.get_group_id()
+        if not group_id:
+            yield event.plain_result(
+                f"请在群聊里使用「/全部相册{album_name}」，私聊无法确定相册归属"
+            )
+            return
+
+        try:
+            douyin: DouyinParser = self._get_parser_by_type(DouyinParser)  # type: ignore
+        except ValueError:
+            yield event.plain_result("主页整批上传需要抖音解析器，请在配置里启用抖音平台")
+            return
+
+        bot = event.bot
+        gid = str(group_id)
+        uploader = self._album_uploader(album_name)
+
+        try:
+            album = await uploader.find_album(bot, gid)
+        except AlbumError as e:
+            yield event.plain_result(f"群相册不可用：{e}")
+            return
+        if album is None:
+            yield event.plain_result(
+                self._album_missing_text(
+                    album_name, await uploader.album_names(bot, gid)
+                )
+            )
+            return
+
+        # 条数：命令里的数字参数优先，其次配置项，最后兜底 20；再统一压到上限 ——
+        # 每个作品都要把媒体完整下载一遍，数量不设限会跑到天荒地老
+        count = limit or self.cfg.all_works_limit or 20
+        count = max(1, min(count, ALL_ALBUM_MAX_WORKS))
+
+        try:
+            works = await douyin.fetch_user_works_from_text(text, count)
+        except ParseException as e:
+            yield event.plain_result(str(e))
+            return
+
+        if not works:
+            yield event.plain_result(
+                "该主页没有取到公开作品，可能主页不可见或没有公开作品"
+            )
+            return
+
+        yield event.plain_result(
+            f"主页共 {len(works)} 个作品，开始逐个上传到群相册「{album.name}」。\n"
+            "每个作品在相册里各自成一条（同一作品的多张图合并成一条说说，"
+            "视频因协议限制各自成贴）；文案写在该条的评论里。\n"
+            "媒体需要逐个下载上传，耗时较长，全部完成后再回一条汇总。"
+        )
+
+        async def _parse_work(aweme_id: str):
+            # 走移动端协议解析单条作品：免 Cookie、免签名、免浏览器，还能拿到
+            # 实况 mp4，结果与单独发这条作品链接时一致
+            return await douyin.parse_mobile(aweme_id)
+
+        async def _upload_work(one) -> UploadReport:
+            report, _lines = await self._upload_one_to_album(
+                bot, gid, album, uploader, one
+            )
+            return report
+
+        # 逐作品编排（单个失败继续后面的）在 core.album 里，便于离线测试
+        outcome = await upload_works_to_album(
+            works, parse_work=_parse_work, upload_one=_upload_work
+        )
+        yield event.plain_result("\n".join(outcome.lines(album.name)))
 
     @filter.event_message_type(filter.EventMessageType.ALL)
     async def on_message(self, event: AstrMessageEvent):
@@ -644,8 +766,15 @@ class ParserPlugin(Star):
         # 群相册上传："/相册<名字> <链接>" 时剥离命令头，解析后上传到该相册；
         # 名字省略时回落到配置项「默认相册名称」
         album_upload = False
+        all_album = False
         album_name = self.cfg.album_name
-        if self.cfg.album_enabled and (parsed := split_album_command(text)):
+        # 主页整批上传要排在单链接的「/相册」之前：「/全部相册少女集 <主页链接>」
+        # 的相册名写在「全部相册」后面，而且「全部」前缀还会被下面的「/全部」抢先匹配
+        if self.cfg.album_enabled and (parsed := split_all_album_command(text)):
+            all_album = True
+            name, text = parsed
+            album_name = name or self.cfg.album_name
+        elif self.cfg.album_enabled and (parsed := split_album_command(text)):
             album_upload = True
             name, text = parsed
             album_name = name or self.cfg.album_name
@@ -672,7 +801,7 @@ class ParserPlugin(Star):
         # 位置参数：条数与音频发送方式，两种顺序都可（如 "文件 10"、"10 文件"）
         limit_param: int | None = None
         mode_param: str | None = None
-        if audio_only or all_music or all_works:
+        if audio_only or all_music or all_works or all_album:
             text, limit_param, mode_param = parse_params(text)
 
         # 指定机制：专门@其他bot的消息不解析
@@ -749,6 +878,18 @@ class ParserPlugin(Star):
                 logger.debug("Bot在仲裁中输了, 跳过解析")
                 return
             logger.debug("Bot在仲裁中胜出, 准备解析...")
+
+        # 主页整批上传相册：「/全部相册<名字> <主页链接>」要逐个作品解析再上传，
+        # 不能落到下面的「单链接解析」；重复触发会重复上传，用独立指纹再拦一次
+        if all_album:
+            if self.debouncer.hit_resource(umo, f"allalbum:{text}"):
+                logger.warning("[资源防抖] 主页整批上传相册在防抖时间内，跳过")
+                return
+            async for res in self._upload_all_to_album(
+                event, album_name, text, limit_param
+            ):
+                yield res
+            return
 
         # 基于link防抖（音频模式/作品清单/相册上传与普通解析是不同意图，不共用防抖）
         link = searched.group(0)
@@ -863,6 +1004,12 @@ class ParserPlugin(Star):
     async def all_music_parser(self, event: AstrMessageEvent):
         """主页音乐清单：/全部音乐 <主页链接>"""
         # 实际解析由 on_message 统一完成，此函数仅用于注册 /全部音乐 命令
+        pass
+
+    @filter.command("全部相册", alias={"相册全部"})
+    async def all_album_parser(self, event: AstrMessageEvent):
+        """主页整批上传相册：/全部相册<名字> <主页链接>，每个作品各成一条"""
+        # 实际解析与上传由 on_message 统一完成，此函数仅用于注册命令
         pass
 
     @filter.command("相册少女集", alias={"相册上传"})

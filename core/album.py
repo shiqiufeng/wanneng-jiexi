@@ -110,7 +110,7 @@ import re
 import time
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any, Iterable
+from typing import Any, Awaitable, Callable, Iterable, Mapping, Sequence
 
 from astrbot.api import logger
 
@@ -292,6 +292,17 @@ ALBUM_RESERVED_NAMES = frozenset(
 )
 """这些词是别的命令或被忽略的写法，不能当相册名"""
 
+ALL_ALBUM_HEAD = re.compile(r"^/?全部相册")
+"""主页整批上传的命令头，相册名写在「全部相册」后面：
+
+    /全部相册少女集 <主页链接>   把该主页的每个作品都传进「少女集」
+    /全部相册 <主页链接>         传进配置项「默认相册名称」里的相册
+
+与 :data:`ALBUM_HEAD` 的区别是主语：这条命令处理的是「主页里的一堆作品」，
+每个作品在相册里各自成一条。前缀「全部」必须排在「相册」之前，否则会被
+``split_album_command`` 当成「上传到名叫『全部相册…』的相册」。
+"""
+
 ALBUM_CREATE_CMD = re.compile(r"^/?创建相册[\s:：]*(.+)$")
 """创建群相册命令：/创建相册旅游、/创建相册 吃喝玩乐"""
 
@@ -325,6 +336,29 @@ def split_album_command(text: str) -> tuple[str, str] | None:
     被当成「上传到『自检』相册」。
     """
     head = ALBUM_HEAD.match(text)
+    if head is None:
+        return None
+    rest = text[head.end() :]
+    token = ALBUM_NAME_TOKEN.match(rest)
+    if token is None:
+        return "", rest
+    name = token.group(1)
+    if _URLISH.search(name) or name in ALBUM_RESERVED_NAMES:
+        return "", rest
+    return name, rest[token.end() :]
+
+
+def split_all_album_command(text: str) -> tuple[str, str] | None:
+    """把「/全部相册<名字> <主页链接>」拆成 (相册名, 剩余文本)
+
+    相册名省略时名字为空串（调用方回落到配置里的默认相册）。不是这条命令时
+    返回 ``None``。
+
+    判定规则与 :func:`split_album_command` 完全一致（名字必须是不含空白的短词，
+    链接开头与保留字都视为「没写名字」），唯一差别是命令头多了「全部」：
+    「/全部相册 https://x」不会被当成「上传到名叫『https』的相册」。
+    """
+    head = ALL_ALBUM_HEAD.match(text)
     if head is None:
         return None
     rest = text[head.end() :]
@@ -655,6 +689,138 @@ class UploadReport:
         for item in self.failures:
             out.append(f"· 失败：{item}")
         return out
+
+
+# ================ 主页整批上传：逐作品编排 ================
+#
+# 「/全部相册<名字> <主页链接>」要把主页里每个作品都传进同一个相册，每个作品在
+# 相册里各自成一条。这段编排（取 ID → 逐条解析 → 逐条上传 → 汇总）放在本模块
+# 而不是 main.py，原因和命令解析一样：main.py 一 import 就要拉起整个 AstrBot，
+# 放这里才能用假回调离线跑通「某个作品解析失败也要继续后面的」这类边界。
+
+#: 作品 ID 的候选字段名。抖音网页接口用 ``aweme_id``，别的分支/版本可能改成
+#: 驼峰或直接 ``id``，都认一下，避免字段名一变就整批「缺少作品 ID」
+_AWEME_ID_KEYS = ("aweme_id", "awemeId", "id")
+
+
+def extract_aweme_id(item: Mapping[str, Any]) -> str:
+    """从主页作品条目里取作品 ID（取不到时返回空串）"""
+    if not isinstance(item, Mapping):
+        return ""
+    for key in _AWEME_ID_KEYS:
+        value = item.get(key)
+        if value is None:
+            continue
+        text = str(value).strip()
+        if text and text != "0":
+            return text
+    return ""
+
+
+@dataclass
+class BatchOutcome:
+    """主页整批上传的结果汇总"""
+
+    total: int = 0
+    """主页取到的作品总数"""
+    ok: int = 0
+    """至少传上去一个媒体的作品数"""
+    images: int = 0
+    """成功上传的图片总张数"""
+    videos: int = 0
+    """成功上传的视频总个数"""
+    titles: int = 0
+    """成功写入文案的总条数"""
+    problems: list[str] = field(default_factory=list)
+    """失败或跳过的作品及原因（按处理顺序）"""
+
+    def lines(self, album_name: str, max_problems: int = 10) -> list[str]:
+        """拼装面向用户的汇总回执
+
+        失败项只列前 ``max_problems`` 条，其余折叠成一句「详见日志」，
+        避免几十个作品全失败时回执刷屏。
+        """
+        out = [
+            f"主页整批上传完成：{self.ok}/{self.total} 个作品已传进群相册"
+            f"「{album_name}」"
+        ]
+        tally: list[str] = []
+        if self.images:
+            tally.append(f"图片 {self.images} 张")
+        if self.videos:
+            tally.append(f"视频 {self.videos} 个")
+        if tally:
+            out.append("· 合计：" + "、".join(tally))
+        if self.titles:
+            out.append(f"· 文案写入评论：{self.titles} 条")
+        for item in self.problems[:max_problems]:
+            out.append(f"· 失败：{item}")
+        if len(self.problems) > max_problems:
+            out.append(
+                f"· 另有 {len(self.problems) - max_problems} 个作品失败，详见日志"
+            )
+        return out
+
+
+async def upload_works_to_album(
+    works: Sequence[Mapping[str, Any]],
+    *,
+    parse_work: Callable[[str], Awaitable[Any]],
+    upload_one: Callable[[Any], Awaitable[UploadReport]],
+    max_problems: int = 10,
+) -> BatchOutcome:
+    """把主页的每个作品逐个解析并上传，返回汇总
+
+    Args:
+        works: 主页作品条目（原始 aweme dict），顺序即上传顺序
+        parse_work: ``(aweme_id) -> ParseResult | None``，解析单个作品
+        upload_one: ``(ParseResult) -> UploadReport``，把单个作品传进相册
+        max_problems: 汇总回执里最多列几条失败
+
+    Returns:
+        BatchOutcome: 统计与失败明细
+
+    单个作品失败（解析不出来、上传报错、没有媒体）**只记一笔并继续**，
+    不会中断整批 —— 主页里混着一条别人的合拍或已删除的作品很常见。
+    """
+    outcome = BatchOutcome(total=len(works))
+    for index, item in enumerate(works, 1):
+        aweme_id = extract_aweme_id(item)
+        if not aweme_id:
+            outcome.problems.append(f"第 {index} 个作品缺少作品 ID")
+            continue
+
+        try:
+            one = await parse_work(aweme_id)
+        except Exception as e:  # noqa: BLE001 - 单个作品失败不影响其余
+            logger.warning(f"[album] 主页作品 {aweme_id} 解析异常：{e}")
+            one = None
+        if one is None or not getattr(one, "contents", None):
+            outcome.problems.append(f"第 {index} 个作品（{aweme_id}）解析失败")
+            continue
+
+        try:
+            report = await upload_one(one)
+        except Exception as e:  # noqa: BLE001 - 同上，继续处理后面的作品
+            logger.warning(f"[album] 主页作品 {aweme_id} 上传异常：{e}")
+            outcome.problems.append(f"第 {index} 个作品（{aweme_id}）上传异常：{e}")
+            continue
+
+        if report.total:
+            outcome.ok += 1
+            outcome.images += report.images
+            outcome.videos += report.videos
+            outcome.titles += report.titles
+        else:
+            first = (report.failures or report.skipped or ["没有可上传的媒体"])[0]
+            outcome.problems.append(f"第 {index} 个作品（{aweme_id}）：{first}")
+
+    if len(outcome.problems) > max_problems:
+        logger.info(
+            f"[album] 主页整批上传完成：{outcome.ok}/{outcome.total} 成功，"
+            f"{len(outcome.problems)} 个失败"
+        )
+    return outcome
 
 
 @dataclass(slots=True, frozen=True)
