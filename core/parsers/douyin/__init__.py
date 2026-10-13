@@ -746,6 +746,10 @@ class DouyinParser(BaseParser):
         """经真实浏览器页面代发请求
 
         页面内的 secsdk 会自动补上签名，因此这里无需 a_bogus，直接拼原始参数。
+
+        页面卡死时（容器内存/CPU 吃紧最常见）第一次请求要等满超时才失败，此时
+        **重建页面再试一次**：一次冷启动十几秒，比一次白等三十几秒划算，而
+        「页面卡死」重启后往往就好了。只重试一次，避免雪崩式等待。
         """
         if not self.browser.available():
             raise ParseException(
@@ -757,8 +761,15 @@ class DouyinParser(BaseParser):
         url = f"{endpoint}?{urlencode(params, safe='')}"
         body = await self.browser.get_json(url, referer=referer)
         if body is None:
-            reason = self.browser.last_error or "未知原因"
-            raise ParseException(f"浏览器代发请求失败：{reason}")
+            first = self.browser.last_error or "未知原因"
+            logger.warning(f"[抖音] 浏览器代发失败（{first}），重建页面后重试一次")
+            body = await self.browser.get_json(url, referer=referer)
+        if body is None:
+            raise ParseException(
+                f"浏览器代发请求失败：{self.browser.last_error or '未知原因'}\n"
+                f"主页作品清单只能经浏览器代发（抖音 Argus 风控），"
+                f"单条作品链接走移动端协议不受影响，可稍后重试本命令。"
+            )
 
         status = body.get("status_code")
         if status not in (0, None):

@@ -56,6 +56,29 @@ UA = (
     "(KHTML, like Gecko) Chrome/130.0.0.0 Safari/537.36 Edg/130.0.0.0"
 )
 
+
+#: 页面内 XHR 脚本自定义的负状态码 → 人话。线上贴回来的日志里出现过
+#: 「返回状态 -2」，不明说就是一轮瞎猜。
+_XHR_STATUS_HINTS: dict[int, str] = {
+    -1: "页面内请求网络错误（XHR onerror）",
+    -2: "页面内请求超时（XHR ontimeout，页面大概率已卡死）",
+    -3: "页面内请求脚本异常（XHR 构造/发送失败）",
+}
+
+
+def _explain_exc(exc: BaseException) -> str:
+    """把异常写成「类型: 说明」
+
+    ``asyncio.TimeoutError`` / ``CancelledError`` 的 ``str()`` 是**空串**，直接
+    ``f"...异常: {e}"`` 打出来就是一行以冒号结尾的日志，看不出是超时还是崩溃
+    —— 线上贴回来的那句「页面内请求异常: 」就是这么来的，白白浪费一轮排查。
+    """
+    name = type(exc).__name__
+    text = str(exc).strip()
+    if not text:
+        return f"{name}（异常自身没有错误信息，通常是超时）"
+    return f"{name}: {text}"
+
 # 在页面上下文里发 XHR 并等待完成；secsdk 会给它自动补签名
 _XHR_SCRIPT = """
 (args) => new Promise((resolve) => {
@@ -122,6 +145,19 @@ class BrowserFetcher:
 
     HOME = "https://www.douyin.com/"
 
+    #: 首页里要拦掉的资源类型。抖音首页会自动播视频、拉一大堆图和字体，在
+    #: 1~2 核的容器上能把渲染进程 CPU 吃满 —— 表现为「页面就绪了，但页面内
+    #: XHR 发出去永远不回来」（外层只能等到超时）。签名只依赖 script/xhr，
+    #: 这些资源拦掉不影响 secsdk 工作。
+    BLOCK_RESOURCE_TYPES = frozenset({"image", "media", "font"})
+
+    #: 连续失败到这个次数就熔断。「/全部 10」「/全部音乐」这类批量请求会连打
+    #: 十几次代发，页面一旦卡死，不熔断就是「每条白等一整个超时」——用户干等
+    #: 好几分钟最后只拿到一句报错。
+    FAIL_STREAK_LIMIT = 3
+    #: 熔断后的冷却秒数（冷却期内请求直接失败，不再占用浏览器）
+    CIRCUIT_COOLDOWN = 180
+
     def __init__(
         self,
         *,
@@ -152,6 +188,47 @@ class BrowserFetcher:
         self.launched_with: str | None = None
         # 启动失败后的冷却截止时间：冷却期内直接报错，不再每次白等一次启动
         self._retry_after: float = 0.0
+        # 请求失败计数与其熔断截止时间（见 FAIL_STREAK_LIMIT）
+        self._fail_streak = 0
+        self._circuit_until: float = 0.0
+
+    # ---------------- 熔断（请求失败） ----------------
+
+    def _circuit_open(self) -> bool:
+        """代发是否处于熔断冷却期
+
+        与启动失败的 ``_retry_after`` 分开：启动失败说明**环境缺内核**，请求失败
+        说明**这条链路当前不通**（页面卡死 / 容器资源吃紧）。两者都要「别再白
+        等」，但给用户的提示不同，不能混用。
+        """
+        if self._circuit_until <= time.monotonic():
+            return False
+        left = int(self._circuit_until - time.monotonic())
+        self.last_error = (
+            f"浏览器代发已连续失败 {self._fail_streak} 次，暂停 {left}s 后再试"
+            f"（冷却期内「/全部」「主页清单」会立即失败；单条作品链接走移动端"
+            f"协议，不受影响）"
+        )
+        return True
+
+    def _note_failure(self) -> None:
+        """记一次**耗时的**请求失败（超时 / 异常），够了就熔断
+
+        只统计超时和异常，不统计 HTTP 403 之类「立刻就回来」的失败：后者不占
+        时间，重试没有代价，而且页面可能自己恢复。
+        """
+        self._fail_streak += 1
+        if self._fail_streak >= self.FAIL_STREAK_LIMIT:
+            self._circuit_until = time.monotonic() + self.CIRCUIT_COOLDOWN
+            logger.warning(
+                f"[browser] 代发连续失败 {self._fail_streak} 次，"
+                f"熔断 {self.CIRCUIT_COOLDOWN}s"
+            )
+
+    def _note_success(self) -> None:
+        self._fail_streak = 0
+        self._circuit_until = 0.0
+        self.last_error = None
 
     @staticmethod
     def available() -> bool:
@@ -198,7 +275,16 @@ class BrowserFetcher:
         才肯启动（否则报 "Running as root without --no-sandbox is not supported"）；
         容器里 ``/dev/shm`` 往往只有 64 MB，``--disable-dev-shm-usage`` 可避免页面崩溃。
         """
-        args = ["--disable-blink-features=AutomationControlled"]
+        args = [
+            "--disable-blink-features=AutomationControlled",
+            # 容器/服务器上没有可见窗口，Chromium 会把页面当成「后台标签页」而
+            # 降频甚至冻结渲染进程 —— 表现为页面内 XHR 发出去后**永远不回来**，
+            # 外层等到超时，日志里只剩一句空的「页面内请求异常: 」（TimeoutError
+            # 的 str 是空串）。这三个开关是容器里跑 Playwright 的标准配置。
+            "--disable-background-timer-throttling",
+            "--disable-backgrounding-occluded-windows",
+            "--disable-renderer-backgrounding",
+        ]
         if os.name == "posix":
             args += ["--no-sandbox", "--disable-dev-shm-usage", "--disable-gpu"]
         return args
@@ -255,6 +341,11 @@ class BrowserFetcher:
                     "Object.defineProperty(navigator,'webdriver',{get:()=>undefined});"
                 )
                 self._page = await self._context.new_page()
+                try:
+                    await self._page.route("**/*", self._on_route)
+                except Exception as e:  # noqa: BLE001
+                    # 拦不掉也不致命，只是容器上会更吃 CPU
+                    logger.debug(f"[browser] 资源拦截未启用: {e}")
                 await self._page.goto(
                     self.HOME,
                     wait_until="domcontentloaded",
@@ -273,6 +364,20 @@ class BrowserFetcher:
                 f"[browser] 抖音页面就绪（通道: {self.launched_with}），接口请求将经页面代发"
             )
             return self._page
+
+    async def _on_route(self, route: Any, request: Any) -> None:
+        """拦掉首页的视频/图片/字体
+
+        目的只有一个：**别让渲染进程忙到排不上我们的 XHR**。容器上 CPU 有限，
+        抖音首页自动播放的视频能把主线程占死，页面内请求于是永远回不来。
+        """
+        try:
+            if request.resource_type in self.BLOCK_RESOURCE_TYPES:
+                await route.abort()
+                return
+        except Exception:  # noqa: BLE001
+            pass
+        await route.continue_()
 
     @staticmethod
     def _launch_hint(err: Exception | None) -> str:
@@ -350,20 +455,39 @@ class BrowserFetcher:
         Returns:
             dict | None: 解析后的 JSON 对象；失败返回 None
         """
+        if self._circuit_open():
+            logger.warning(f"[browser] {self.last_error}")
+            return None
+
         try:
             page = await self._ensure_page()
         except Exception as e:  # noqa: BLE001
             logger.warning(f"[browser] 页面不可用: {e}")
+            self._note_failure()
             return None
 
         try:
             result = await asyncio.wait_for(
                 page.evaluate(_XHR_SCRIPT, {"url": url, "timeout": timeout}),
-                timeout=timeout + 15,
+                timeout=timeout + 5,
             )
+        except asyncio.TimeoutError:
+            # 页面里 XHR 没在约定时间内回来：多半是页面卡死（容器内存/CPU 吃紧
+            # 时很常见）。再用 page.request 探一次，区分「页面死了」和「页面活着
+            # 但签名那步没走通」——这两种的处置完全不一样，日志里必须能看出来。
+            hint = await self._probe_by_request(page, url)
+            reason = f"页面内请求超时（{timeout + 5}s 无响应）；{hint}"
+            logger.warning(f"[browser] {reason}: {url[:90]}")
+            self.last_error = reason
+            self._note_failure()
+            # 页面可能已崩溃，关掉让下次重建
+            await self.close()
+            return None
         except Exception as e:  # noqa: BLE001
-            logger.warning(f"[browser] 页面内请求异常: {e}")
-            self.last_error = f"页面内请求异常: {e}"
+            reason = f"页面内请求异常: {_explain_exc(e)}"
+            logger.warning(f"[browser] {reason}")
+            self.last_error = reason
+            self._note_failure()
             # 页面可能已崩溃，关掉让下次重建
             await self.close()
             return None
@@ -373,8 +497,11 @@ class BrowserFetcher:
         status = int(result.get("status") or 0)
         text = result.get("text") or ""
         if status != 200:
-            logger.warning(f"[browser] 页面内请求返回状态 {status}: {url[:90]}")
-            self.last_error = f"页面内请求返回状态 {status}"
+            # -1 网络错误 / -2 XHR 自身超时 / -3 脚本抛错：都是页面给的，
+            # 要说清楚，否则日志里一个「返回状态 -2」根本没法判断
+            reason = _XHR_STATUS_HINTS.get(status) or f"页面内请求返回状态 {status}"
+            logger.warning(f"[browser] {reason}: {url[:90]}")
+            self.last_error = reason
             return None
 
         import json
@@ -385,8 +512,34 @@ class BrowserFetcher:
             logger.warning(f"[browser] 响应不是合法 JSON: {text[:120]}")
             self.last_error = "响应不是合法 JSON"
             return None
-        self.last_error = None
+        self._note_success()
         return body if isinstance(body, dict) else None
+
+    async def _probe_by_request(self, page: Any, url: str, *, timeout: int = 10) -> str:
+        """用 ``page.request`` 快速探一次，判断页面是不是还活着
+
+        与页面内 XHR 的区别：它不经 secsdk，所以接口侧大概率回 403 —— 但正因为
+        如此，它的结果很能说明问题：
+
+        * 返回 403/其它 HTTP 状态 → **页面活着**，只是 XHR 那条路没走通
+          （secsdk 没 hook 上，或页面在忙），重建页面值得一试；
+        * 也超时 / 连不上 → **页面真卡死了**，换多少次都一样，该去查容器资源。
+        """
+        if page is None or page.is_closed():
+            return "页面已关闭"
+        try:
+            resp = await asyncio.wait_for(
+                page.request.get(url, timeout=timeout * 1000),
+                timeout=timeout + 5,
+            )
+        except Exception as e:  # noqa: BLE001
+            return f"再用 page.request 直连探测同样失败（{_explain_exc(e)}）→ 页面已卡死"
+        status = getattr(resp, "status", "?")
+        try:
+            await resp.dispose()
+        except Exception:  # noqa: BLE001
+            pass
+        return f"再用 page.request 直连探测返回 HTTP {status}（页面活着，是 XHR 那条路不通）"
 
     async def fetch_bytes(
         self, url: str, *, timeout: int = 30, max_bytes: int = 20 * 1024 * 1024
@@ -414,10 +567,15 @@ class BrowserFetcher:
         Returns:
             bytes | None: 取到的字节；失败返回 None
         """
+        if self._circuit_open():
+            logger.debug(f"[browser] {self.last_error}")
+            return None
+
         try:
             page = await self._ensure_page()
         except Exception as e:  # noqa: BLE001
             logger.warning(f"[browser] 页面不可用: {e}")
+            self._note_failure()
             return None
 
         raw = await self._bytes_via_request_context(page, url, timeout, max_bytes)
@@ -434,7 +592,7 @@ class BrowserFetcher:
             )
             self.last_error = "图片体积超过上限"
             return None
-        self.last_error = None
+        self._note_success()
         logger.info(f"[browser] 经页面取图成功：{len(raw)} 字节 | {url[:80]}")
         return raw
 
@@ -455,7 +613,7 @@ class BrowserFetcher:
                 timeout=timeout * 1000,
             )
         except Exception as e:  # noqa: BLE001
-            logger.warning(f"[browser] 页面请求上下文取图失败: {e}")
+            logger.warning(f"[browser] 页面请求上下文取图失败: {_explain_exc(e)}")
             return None
         try:
             if resp.status != 200:
@@ -476,38 +634,28 @@ class BrowserFetcher:
         try:
             result = await asyncio.wait_for(
                 page.evaluate(_XHR_BYTES_SCRIPT, {"url": url, "timeout": timeout}),
-                timeout=timeout + 15,
+                timeout=timeout + 5,
             )
         except Exception as e:  # noqa: BLE001
-            logger.warning(f"[browser] 页面内取图异常: {e}")
-            self.last_error = f"页面内取图异常: {e}"
+            reason = f"页面内取图异常: {_explain_exc(e)}"
+            logger.warning(f"[browser] {reason}")
+            self.last_error = reason
+            self._note_failure()
+            # 页面可能已崩溃，关掉让下次重建
             await self.close()
             return None
 
         status = int(result.get("status") or 0)
         b64 = result.get("b64") or ""
         if status != 200 or not b64:
-            logger.warning(f"[browser] 页面内取图返回状态 {status}: {url[:90]}")
-            self.last_error = f"页面内取图返回状态 {status}"
+            reason = _XHR_STATUS_HINTS.get(status) or f"页面内取图返回状态 {status}"
+            logger.warning(f"[browser] {reason}: {url[:90]}")
+            self.last_error = reason
             return None
 
         try:
             return base64.b64decode(b64)
         except Exception as e:  # noqa: BLE001
-            logger.warning(f"[browser] 取图结果解码失败: {e}")
+            logger.warning(f"[browser] 取图结果解码失败: {_explain_exc(e)}")
             self.last_error = "取图结果解码失败"
             return None
-
-        if len(raw) > max_bytes:
-            logger.warning(
-                f"[browser] 取到的图片 {len(raw) / 1024 / 1024:.1f}MB 超过上限，放弃"
-            )
-            self.last_error = "图片体积超过上限"
-            return None
-        if not raw:
-            self.last_error = "取到的图片为空"
-            return None
-
-        self.last_error = None
-        logger.info(f"[browser] 经页面取图成功：{len(raw)} 字节 | {url[:80]}")
-        return raw
