@@ -80,11 +80,30 @@ _✨ 发个链接，剩下的交给它 ✨_
 
 ## 💿 安装
 
-1. 把 `万能解析.zip` 解压后的文件夹放进 AstrBot 的 `data/plugins/` 目录，或直接在 AstrBot 插件市场搜索安装；
-2. 重启 AstrBot（或在插件管理页重载插件）；
-3. 打开插件配置面板，按需开启平台、填写 Cookie / 代理等。
+### 方式一：面板「从文件安装」（推荐）
 
-> 插件包名与文件夹名需保持一致（均为 `万能解析`）。若你从旧包名 `astrbot_plugin_parser_live` 升级而来，数据目录会自动兼容，Cookies 与缓存不会丢失。
+1. 下载 `万能解析.zip`（可在本仓库的 **Releases** 页面获取，或本地执行 `python tools/package.py` 生成）；
+2. 打开 AstrBot 面板 → **插件** → 右上角安装按钮 → 选 **从文件安装** → **选择文件** → 选中该 zip；
+3. 点击 **安装**，等待依赖装完，插件会自动出现在列表中并处于启用状态。
+
+### 方式二：解压到插件目录
+
+把 zip 解压出的 `万能解析/` 整个文件夹放进 AstrBot 的 `data/plugins/` 目录，然后重启或在面板重载。
+
+> AstrBot 会按 `metadata.yaml` 的 `name` 字段决定安装目录名，因此 zip 内层文件夹叫什么不影响结果；
+> 插件包名与安装后的文件夹名均为 `万能解析`。若你从旧包名 `astrbot_plugin_parser_live` 升级而来，
+> 数据目录会自动兼容，Cookies 与缓存不会丢失。
+
+### 自行打包
+
+```bash
+python tools/package.py          # 生成 dist/万能解析.zip
+python tools/verify_archive.py   # 按 AstrBot 的安装校验逻辑自检压缩包
+```
+
+`tools/verify_archive.py` 复刻了 AstrBot 安装流程中的真实校验（根目录推断、metadata 定位、
+`name/desc/version/author` 必需字段、安装目录名是否为合法 Python 标识符），
+可在上传前提前发现「压缩包不是合法的 AstrBot 插件」这类问题。
 
 ### 依赖
 
