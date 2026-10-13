@@ -482,32 +482,35 @@ class DouyinParser(BaseParser):
     async def _fetch_live_map(self, video_id: str) -> dict[int, list[str]]:
         """补充查询实况(动态)直链，返回 {图片下标: [实况 mp4 候选直链...]}
 
-        分享页 HTML 和 slidesinfo 接口里的 images[].video 恒为 null，
-        实况直链只在带 a_bogus 签名的 web 详情接口里返回，因此查
-        aweme/detail 接口取 images[].video.play_addr。下标与分享页的
-        images 顺序一致（已实测比对），可用于剔除同一张图的静态图。
+        分享页 HTML 和 slidesinfo 接口里的 images[].video 恒为 null，实况直链只能
+        由作品详情接口给出。这里**先走移动端 App 协议**（免 Cookie / 免签名 /
+        免浏览器，见 mobile.py），拿不到才退回被 Argus 风控的 PC web 详情接口
+        （那条路必须浏览器代发）。
+
+        多数图文作品本来就没有实况，此时移动端返回的 images[] 里根本不会出现
+        video，直接返回空表并按 debug 记录即可——旧版无论有没有实况都去敲 PC
+        接口，于是每解析一篇图文都要白吃一个 403，还顺手报一句
+        「未下载浏览器内核」，把正常行为渲染成故障。
 
         每项返回整组候选直链（首选在前），个别 CDN 节点 403 时可自动回退。
         """
-        try:
-            detail = await self._fetch_aweme_detail(video_id)
-        except (ClientError, TimeoutError, ValueError, ParseException) as e:
-            # 这里若静默失败，用户只会看到「实况变静态图」而没有任何提示，
-            # 因此用 warning 级记录，便于在面板日志里定位。
-            logger.warning(f"[抖音] 实况直链获取失败，本次将发送静态图: {e}")
-            return {}
+        detail = await self._fetch_aweme_mobile(video_id)
+        if not detail:
+            try:
+                detail = await self._fetch_aweme_web(video_id)
+            except (ClientError, TimeoutError, ValueError, ParseException) as e:
+                # 单条作品本身已不依赖浏览器，这里失败只意味着「实况降级为静态图」，
+                # 用 warning 级记录，便于在面板日志里定位。
+                logger.warning(f"[抖音] 实况直链获取失败，本次将发送静态图: {e}")
+                return {}
 
         if not detail:
             logger.warning("[抖音] 实况直链获取失败：详情接口未返回作品数据")
             return {}
 
-        live_map: dict[int, list[str]] = {}
-        for index, image in enumerate(detail.get("images") or []):
-            if not isinstance(image, dict):
-                continue
-            video = image.get("video")
-            if isinstance(video, dict) and (urls := self._pick_url_lists(video, "play_addr")):
-                live_map[index] = urls
+        live_map = mobile.live_map(detail)
+        if not live_map:
+            logger.debug(f"[抖音] 该作品没有实况内容，按静态图发送: {video_id}")
         return live_map
 
     def _create_media_contents(
@@ -670,22 +673,6 @@ class DouyinParser(BaseParser):
         params = self._build_web_params()
         params["aweme_id"] = aweme_id
         return params
-
-    @staticmethod
-    def _pick_url_list(node: dict, key: str) -> str | None:
-        """从 node[key].url_list 里取第一个地址"""
-        child = node.get(key)
-        if isinstance(child, dict) and (urls := child.get("url_list")):
-            return urls[0]
-        return None
-
-    @staticmethod
-    def _pick_url_lists(node: dict, key: str) -> list[str]:
-        """从 node[key].url_list 里取出全部候选地址（按可用性排序）"""
-        child = node.get(key)
-        if isinstance(child, dict) and (urls := child.get("url_list")):
-            return mobile.order(urls)
-        return []
 
     async def _request_web_api(
         self, endpoint: str, params: dict[str, str], referer: str

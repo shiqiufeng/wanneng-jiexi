@@ -8,13 +8,26 @@
 
 实测发现
 --------
-**移动端 App 的推荐流协议不在 Argus 门禁内**：
+**移动端 App 的 feed 协议不在 Argus 门禁内**：
 
-    GET https://api5-normal-c-hl.amemv.com/aweme/v1/feed/?aweme_id=<id>&aid=6383
+    GET https://api5-normal-c-hl.amemv.com/aweme/v1/feed/?aweme_id=<id>&aid=<aid>
     User-Agent: com.ss.android.ugc.aweme/300500 (Linux; U; Android 13; zh_CN; ...)
 
 无需 Cookie、无需 ``ttwid``/``a_bogus``/``msToken``/secsdk 签名，HTTP 200，
-且 ``aweme_list`` 中**恰好包含被请求的那条作品本身**，字段完整：
+``aweme_list`` 里会把被请求的那条作品**排在首位**。但这有两个前提，缺一个就
+退化回「看心情的推荐流」：
+
+1. **必须带完整设备参数**（``device_id`` / ``iid`` / ``device_platform`` /
+   ``version_code`` / ``os_version`` / ``device_type`` …）。实测不带头这些参数
+   时，4 个节点 × 2 个 aid 全部拿不到目标作品，返回的是一串毫不相干的推荐——
+   上层于是只能退回被 Argus 拦死的 PC web 详情接口，表现就是
+   「实况又变静态图」+ 满屏 403/浏览器告警。
+2. **要遍历多个 ``aid``**：不同 aid 下发的字段完整度不同。实测**同一条实况作品**，
+   ``aid=1128``/``2329`` 能命中但 ``images[].video`` 为空，只有 ``aid=6383``
+   会把实况 mp4 一起给出来；图文作品则反过来——``6383`` 压根不返回目标作品。
+   所以这里逐个 aid 取值，最后挑数据最全的一份（见 :func:`_score`）。
+
+字段完整时可直接取到：
 
 * ``video.play_addr.url_list`` / ``video.bit_rate[].play_addr.url_list``
   —— 无水印 mp4 直链（可按 ``is_h265==0`` + 码率挑最优档）
@@ -27,11 +40,14 @@
 局限
 ----
 该协议只支持按作品 ID 取详情；作者主页作品列表（``/aweme/v1/aweme/post/``）
-在该通道返回空列表，主页清单目前仍只能走 web 接口。
+即便带上完整设备参数也返回空 ``aweme_list``（旧版 ``iesdouyin`` 通道已下线），
+主页清单目前仍只能走被 Argus 风控的 web 接口。
 """
 
 from __future__ import annotations
 
+import random
+import time
 from typing import Any
 
 from aiohttp import ClientTimeout
@@ -56,8 +72,36 @@ FEED_HOSTS: tuple[str, ...] = (
 
 FEED_PATH = "/aweme/v1/feed/"
 
-#: aid=6383 实测会把被请求的作品排在首位；1128 作为补充再试一轮
-FEED_AIDS: tuple[str, ...] = ("6383", "1128")
+#: 逐个 aid 试；谁把目标作品连实况 mp4 一起给出来就用谁（见模块 docstring）
+FEED_AIDS: tuple[str, ...] = ("1128", "2329", "6383")
+
+#: 设备指纹：进程内固定。每次请求都换新 ID 反而不像真实客户端，
+#: 且实测同一 device_id 连续请求的命中率稳定。
+_DEVICE_ID = str(random.randint(10**18, 10**19))
+_IID = str(random.randint(10**18, 10**19))
+
+
+def feed_params(aweme_id: str, aid: str) -> dict[str, str]:
+    """移动端 feed 接口参数
+
+    设备参数不是可选装饰：缺了它们接口会退化成纯推荐流，请求的作品不出现在
+    返回列表里（详见模块 docstring 的实测结论）。
+    """
+    return {
+        "aweme_id": aweme_id,
+        "aid": aid,
+        "device_platform": "android",
+        "version_code": "300500",
+        "version_name": "30.5.0",
+        "manifest_version_code": "300500",
+        "update_version_code": "300500",
+        "os_version": "13",
+        "device_type": "Pixel 6",
+        "device_id": _DEVICE_ID,
+        "iid": _IID,
+        "channel": "googleplay",
+        "ts": str(int(time.time())),
+    }
 
 
 #: 实测该节点对部分资源（尤其 image-cut-tos-priv 封面）返回 403，同路径的
@@ -109,10 +153,10 @@ def pick_image_url(node: Any) -> str | None:
 def pick_aweme(body: Any, aweme_id: str) -> dict[str, Any] | None:
     """从 feed 响应里挑出目标作品
 
-    **只认精确命中**：该协议返回的是「推荐流」，被请求的作品通常排在首位，
-    但并非总是出现（实测部分 slides 作品就不在列表里）。此前找不到时会退而
-    取第一条，会把一条毫不相干的视频当成用户要的链接发出去，因此改为严格匹配，
-    匹配不到就交给上层走其它通道。
+    **只认精确命中**：参数带全时该接口会把目标作品排在 ``aweme_list`` 首位，但
+    参数不全时它会退化成纯推荐流（返回一串毫不相干的作品，实测目标作品根本不在
+    列表里）。此前找不到目标就退而取第一条，等于把一条无关视频当成用户发的链接
+    发出去，因此改为严格匹配，匹配不到就交给上层走其它通道。
     """
     if not isinstance(body, dict):
         return None
@@ -138,23 +182,32 @@ async def fetch_aweme(
 ) -> dict[str, Any] | None:
     """经移动端 feed 协议取回作品 JSON（免浏览器 / 免 Cookie / 免签名）
 
+    逐个 ``aid`` 取值（每次都带完整设备参数），只要某个 aid 精确命中了目标作品
+    就收下，最后返回**数据最全**的那份；已经拿到视频直链或实况 mp4 时提前结束。
+
     Args:
         session: aiohttp 的 ClientSession（插件的 self.session）
         aweme_id: 作品 ID
         timeout: 单节点超时秒数
 
     Returns:
-        dict | None: 作品对象；全部节点失败返回 None
+        dict | None: 作品对象；全部节点/全部 aid 都没命中时返回 None
     """
     headers = {"User-Agent": MOBILE_UA, "Accept": "application/json"}
     req_timeout = ClientTimeout(total=timeout)
+    best: dict[str, Any] | None = None
+    preferred_host: str | None = None
     for aid in FEED_AIDS:
-        for host in FEED_HOSTS:
+        # 已经命中过的节点继续排最前，后续 aid 不必再从头把坏节点试一遍
+        hosts = [h for h in FEED_HOSTS if h != preferred_host]
+        if preferred_host:
+            hosts.insert(0, preferred_host)
+        for host in hosts:
             url = f"https://{host}{FEED_PATH}"
             try:
                 async with session.get(
                     url,
-                    params={"aweme_id": aweme_id, "aid": aid},
+                    params=feed_params(aweme_id, aid),
                     headers=headers,
                     timeout=req_timeout,
                 ) as resp:
@@ -164,9 +217,15 @@ async def fetch_aweme(
             except Exception:  # noqa: BLE001 - 单节点失败即换下一个
                 continue
             aweme = pick_aweme(body, aweme_id)
-            if aweme:
-                return aweme
-    return None
+            if not aweme:
+                continue
+            preferred_host = preferred_host or host
+            if best is None or _score(aweme) > _score(best):
+                best = aweme
+            break  # 该 aid 已命中，换下一个 aid 看有没有更全的数据
+        if best is not None and (not is_image_post(best) or has_live(best)):
+            break  # 视频直链 / 实况 mp4 已就位，没必要再问其它 aid
+    return best
 
 
 # ---------------------------------------------------------------- 字段提取 ----
@@ -244,6 +303,39 @@ def best_play_url(video: dict[str, Any]) -> str | None:
     """从 video 对象里挑首选直链"""
     urls = best_play_urls(video)
     return urls[0] if urls else None
+
+
+def live_count(aweme: dict[str, Any]) -> int:
+    """作品里有几张图带实况（Live Photo）mp4"""
+    return sum(1 for image in images(aweme) if live_urls(image))
+
+
+def has_live(aweme: dict[str, Any]) -> bool:
+    """作品是否含实况"""
+    return live_count(aweme) > 0
+
+
+def live_map(aweme: dict[str, Any]) -> dict[int, list[str]]:
+    """{图片下标: [实况 mp4 候选直链...]}
+
+    下标与 ``images`` 顺序一致，非实况图不会出现在结果里；没有实况时返回空表。
+    上层据此把「该作品本来就没有实况」与「实况直链取失败」区分开。
+    """
+    result: dict[int, list[str]] = {}
+    for index, image in enumerate(images(aweme)):
+        if urls := live_urls(image):
+            result[index] = urls
+    return result
+
+
+def _score(aweme: dict[str, Any]) -> tuple[int, int, int]:
+    """数据完整度评分（越大越好），用于在多个 aid 的返回里挑最全的一份
+
+    实况张数 > 图片张数 > 是否有可用视频直链。
+    """
+    video = aweme.get("video")
+    has_video = 1 if isinstance(video, dict) and best_play_urls(video) else 0
+    return (live_count(aweme), len(images(aweme)), has_video)
 
 
 def is_image_post(aweme: dict[str, Any]) -> bool:

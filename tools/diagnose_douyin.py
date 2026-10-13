@@ -1,16 +1,24 @@
 #!/usr/bin/env python3
-"""抖音「浏览器兜底」环境自检（万能解析）
+"""抖音实况 / 详情链路自检（万能解析）
 
-在 AstrBot 所在的机器上直接运行，逐步定位实况直链取不到的原因：
+在 AstrBot 所在的机器上直接运行：
 
-    python tools/diagnose_douyin.py
+    python tools/diagnose_douyin.py                       # 用内置样本作品做全量自检
     python tools/diagnose_douyin.py 7695197082320078763   # 指定作品 ID
-    python tools/diagnose_douyin.py --install              # 顺手把浏览器内核装上再自检
+    python tools/diagnose_douyin.py --install             # 顺手把浏览器内核装上再自检
+    python tools/diagnose_douyin.py --no-browser          # 只查单条作品通道，跳过浏览器环境
+
+检查顺序：
+
+    [1]     运行环境
+    [2]     移动端免浏览器通道 —— **单条作品（视频 / 图文 / 实况）真正走的通道**：
+            普通 HTTP 直连 App feed 接口，必须带完整设备参数，并逐个 aid 试到拿到实况 mp4。
+            这一步通过，单条链接就完全不需要浏览器。
+    [3..8]  浏览器环境 —— 只服务 `/全部`、`/全部音乐` 的主页清单：
+            playwright 包 → Chromium 内核 → 能否启动（含 --no-sandbox）→ 打开首页拿风控
+            Cookie → 页面代发 aweme/detail 并取实况 mp4。
 
 脚本不依赖本插件任何模块，只用标准库 + playwright，可单独拷到服务器上跑。
-它会依次检查：Python 环境 → playwright 是否可导入 → Chromium 内核是否已下载
-→ 能否启动（含 --no-sandbox）→ 能否打开抖音首页并拿到风控 Cookie
-→ 能否经页面代发 aweme/detail 并取到实况 mp4 直链。
 """
 
 from __future__ import annotations
@@ -18,11 +26,16 @@ from __future__ import annotations
 import asyncio
 import glob
 import importlib.util
+import json
 import os
 import platform
+import random
 import shutil
 import subprocess
 import sys
+import time
+import urllib.error
+import urllib.request
 from pathlib import Path
 from urllib.parse import urlencode
 
@@ -35,6 +48,113 @@ HOT_URL = "https://www.douyin.com/aweme/v1/web/hot/search/list/"
 OK = "  [ 通过 ]"
 NO = "  [ 失败 ]"
 WA = "  [ 注意 ]"
+
+# ---------------- 移动端免浏览器通道（与 core/parsers/douyin/mobile.py 保持一致） ----
+MOBILE_UA = (
+    "com.ss.android.ugc.aweme/300500 (Linux; U; Android 13; zh_CN; "
+    "Pixel 6; Build/TQ3A; Cronet/58.0.2991.0)"
+)
+FEED_HOSTS = (
+    "api5-normal-c-hl.amemv.com",
+    "aweme.snssdk.com",
+    "api-hl.amemv.com",
+    "api.amemv.com",
+)
+FEED_AIDS = ("1128", "2329", "6383")
+
+
+def feed_url(host: str, aweme_id: str, aid: str, device_id: str, iid: str) -> str:
+    """拼出带完整设备参数的 feed 请求地址
+
+    设备参数不是可选装饰：少带就会被接口当成「随便给点推荐」，返回的列表里
+    根本没有目标作品（v1.8.3 修掉的正是这个静默失效）。
+    """
+    params = {
+        "aweme_id": aweme_id,
+        "aid": aid,
+        "device_platform": "android",
+        "version_code": "300500",
+        "version_name": "30.5.0",
+        "manifest_version_code": "300500",
+        "update_version_code": "300500",
+        "os_version": "13",
+        "device_type": "Pixel 6",
+        "device_id": device_id,
+        "iid": iid,
+        "channel": "googleplay",
+        "ts": str(int(time.time())),
+    }
+    return f"https://{host}/aweme/v1/feed/?" + urlencode(params)
+
+
+def pick_aweme(body: dict, aweme_id: str) -> dict | None:
+    """只认精确命中（同插件实现）"""
+    for item in body.get("aweme_list") or []:
+        if isinstance(item, dict) and str(item.get("aweme_id")) == str(aweme_id):
+            return item
+    return None
+
+
+def live_play_urls(image: dict) -> list[str]:
+    """取单张图的实况 mp4 候选直链（优先 bit_rate，再退回 play_addr）"""
+    video = image.get("video")
+    if not isinstance(video, dict):
+        return []
+    urls: list[str] = []
+    for entry in video.get("bit_rate") or []:
+        if not isinstance(entry, dict):
+            continue
+        node = entry.get("play_addr")
+        if isinstance(node, dict):
+            urls += [u for u in node.get("url_list") or [] if isinstance(u, str)]
+    node = video.get("play_addr")
+    if isinstance(node, dict):
+        urls += [u for u in node.get("url_list") or [] if isinstance(u, str)]
+    return list(dict.fromkeys(urls))
+
+
+def check_mobile_channel(aweme_id: str) -> tuple[bool, int, dict | None]:
+    """跑一遍移动端免浏览器通道，返回 (是否精确命中, 实况张数, 作品对象)"""
+    device_id = str(random.randint(10**18, 10**19))
+    iid = str(random.randint(10**18, 10**19))
+    best: dict | None = None
+    best_live = -1
+    for aid in FEED_AIDS:
+        for host in FEED_HOSTS:
+            url = feed_url(host, aweme_id, aid, device_id, iid)
+            try:
+                req = urllib.request.Request(
+                    url, headers={"User-Agent": MOBILE_UA, "Accept": "application/json"}
+                )
+                with urllib.request.urlopen(req, timeout=15) as resp:
+                    body = json.loads(resp.read().decode("utf-8", "replace"))
+            except (urllib.error.URLError, TimeoutError, ValueError, OSError) as e:
+                print(f"    {host:30s} aid={aid} 请求失败: {type(e).__name__}")
+                continue
+            if not isinstance(body, dict):
+                print(f"    {host:30s} aid={aid} 返回非 JSON 对象")
+                continue
+            aweme = pick_aweme(body, aweme_id)
+            n_list = len(body.get("aweme_list") or [])
+            if not aweme:
+                print(f"    {host:30s} aid={aid} HTTP 200 list={n_list} 未命中")
+                continue
+            images = [i for i in (aweme.get("images") or []) if isinstance(i, dict)]
+            live = sum(1 for i in images if live_play_urls(i))
+            print(
+                f"    {host:30s} aid={aid} HTTP 200 命中 ✓ "
+                f"images={len(images)} 实况={live}"
+            )
+            if live > best_live or best is None:
+                best, best_live = aweme, live
+            # 视频直链 / 实况 mp4 已就位，无需再问其它 aid
+            if not images or live:
+                return True, max(best_live, 0), best
+            break
+    if best is None:
+        return False, 0, None
+    return True, max(best_live, 0), best
+
 
 
 def head(n: int, title: str) -> None:
@@ -171,7 +291,7 @@ def do_install() -> int:
     return rc
 
 
-async def run(aweme_id: str) -> int:
+async def run(aweme_id: str, check_browser: bool = True) -> int:
     # ---------------- 1. 环境 ----------------
     head(1, "运行环境")
     print(f"  Python   : {sys.version.split()[0]}")
@@ -180,8 +300,29 @@ async def run(aweme_id: str) -> int:
     print(f"  是否 root: {os.geteuid() == 0 if hasattr(os, 'geteuid') else 'N/A'}")
     print(f"  os.name  : {os.name}")
 
-    # ---------------- 2. playwright ----------------
-    head(2, "playwright Python 包")
+    # ---------------- 2. 移动端免浏览器通道 ----------------
+    head(2, "移动端免浏览器通道（单条作品真正走的通道）")
+    print(f"  作品 ID : {aweme_id}")
+    print(f"  节点    : {', '.join(FEED_HOSTS)}")
+    print(f"  aid     : {', '.join(FEED_AIDS)}（逐个试，取数据最全的一份）")
+    print("  正在请求（纯 HTTP，不需要 Cookie / 签名 / 浏览器）...")
+    mobile_ok, live_n, _aweme = check_mobile_channel(aweme_id)
+    if mobile_ok:
+        print(f"\n{OK} 精确命中目标作品，实况 {live_n} 张")
+        print("  → 单条视频 / 图文 / 实况链接**完全不需要浏览器**；")
+        print("    服务器不装浏览器内核也能正常解析单条链接。")
+    else:
+        print(f"\n{NO} 所有节点 × 所有 aid 都没能精确命中目标作品")
+        print("  → 该作品会退回分享页（SSR）解析；分享页也拿不到时才用到浏览器通道。")
+        print("  → 若这条是图文/实况作品，表现为「实况变成静态图」或整条解析失败。")
+
+    if not check_browser:
+        print("\n  （--no-browser）已跳过浏览器环境检查。")
+        print("  注意：`/全部`、`/全部音乐` 的**主页作品清单**仍需要 playwright 内核。")
+        return 0
+
+    # ---------------- 3. playwright ----------------
+    head(3, "playwright Python 包（只服务 /全部）")
     try:
         import playwright  # noqa: F401
         from playwright.async_api import async_playwright
@@ -191,8 +332,8 @@ async def run(aweme_id: str) -> int:
         print("\n  修复: python -m pip install playwright")
         return 1
 
-    # ---------------- 3. 浏览器内核 ----------------
-    head(3, "Chromium 内核")
+    # ---------------- 4. 浏览器内核 ----------------
+    head(4, "Chromium 内核")
     d = browsers_dir()
     print(f"  内核目录: {d}")
     kernel_hits: list[str] = []
@@ -226,8 +367,8 @@ async def run(aweme_id: str) -> int:
     else:
         print("\n  内核齐备，无需额外安装。")
 
-    # ---------------- 4. 启动浏览器 ----------------
-    head(4, "启动浏览器")
+    # ---------------- 5. 启动浏览器 ----------------
+    head(5, "启动浏览器")
     args = build_launch_args()
     print(f"  启动参数: {args}")
 
@@ -256,8 +397,8 @@ async def run(aweme_id: str) -> int:
         await pw.stop()
         return 1
 
-    # ---------------- 5. 打开抖音首页 ----------------
-    head(5, "打开抖音首页（等 secsdk 种 Cookie）")
+    # ---------------- 6. 打开抖音首页 ----------------
+    head(6, "打开抖音首页（等 secsdk 种 Cookie）")
     try:
         ctx = await browser.new_context(
             user_agent=(
@@ -289,7 +430,7 @@ async def run(aweme_id: str) -> int:
         await pw.stop()
         return 1
 
-    # ---------------- 6. 页面代发接口 ----------------
+    # ---------------- 7. 页面代发接口 ----------------
     xhr = """
     (args) => new Promise((resolve) => {
         try {
@@ -307,7 +448,7 @@ async def run(aweme_id: str) -> int:
     })
     """
 
-    head(6, "检查 1：热搜接口（验证「页面代发」链路本身）")
+    head(7, "检查 1：热搜接口（验证「页面代发」链路本身）")
     hot = f"{HOT_URL}?{urlencode({'device_platform': 'webapp', 'aid': '6383', 'channel': 'channel_pc_web', 'detail_list': '1'}, safe='')}"
     r = await page.evaluate(xhr, {"url": hot, "timeout": 30})
     print(f"  页面内返回 HTTP 状态: {r['status']}")
@@ -316,7 +457,7 @@ async def run(aweme_id: str) -> int:
     else:
         print(f"{NO} 浏览器代发链路异常 —— 即使接口未被封也拿不到数据")
 
-    head(7, "检查 2：作品详情接口（实况直链的来源）")
+    head(8, "检查 2：作品详情接口（浏览器通道取实况直链）")
     print(f"  作品 ID: {aweme_id}")
     url = f"{DETAIL_URL}?{urlencode(build_detail_params(aweme_id), safe='')}"
     r = await page.evaluate(xhr, {"url": url, "timeout": 40})
@@ -367,7 +508,7 @@ def main() -> int:
     rest = [a for a in argv if not a.startswith("-")]
     aweme_id = rest[0] if rest else DEFAULT_AWEME_ID
     try:
-        return asyncio.run(run(aweme_id))
+        return asyncio.run(run(aweme_id, check_browser="--no-browser" not in argv))
     except KeyboardInterrupt:
         return 130
 
