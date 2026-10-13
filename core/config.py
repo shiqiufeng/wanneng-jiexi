@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import re
 import zoneinfo
 from collections.abc import Mapping, MutableMapping
 from pathlib import Path
@@ -248,6 +249,7 @@ class PluginConfig(ConfigNode):
 
     album_enabled: bool
     album_name: str
+    album_owner_ids: list[str]
     album_title_comment: bool
     album_base64_fallback: bool
     album_max_media: int
@@ -283,6 +285,15 @@ class PluginConfig(ConfigNode):
         # 群相册：相册名留空时按「少女集」处理，与命令名保持一致
         self.album_name = (self.album_name or "").strip() or "少女集"
         self.album_max_media = self.album_max_media or 20
+
+        # 相册所有者：只有这些 QQ 能用「/删除相册」。
+        # 「/创建相册」除了所有者，群主与群管理员也能用（判定见 main.py）。
+        owner_ids = self.album_owner_ids
+        if isinstance(owner_ids, str):  # 手写配置时可能填成逗号分隔的字符串
+            owner_ids = re.split(r"[,，\s]+", owner_ids)
+        self.album_owner_ids = [
+            str(item).strip() for item in (owner_ids or []) if str(item).strip()
+        ] or ["3556654921"]
 
         # 短链服务(Url-Shorten-Worker)：地址与密码都填了才启用
         self.shortlink_api = (self.shortlink_api or "").strip()

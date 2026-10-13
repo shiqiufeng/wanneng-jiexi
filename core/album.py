@@ -65,6 +65,22 @@ OneBot 信封里 ``data: undefined`` 序列化后直接消失，aiocqhttp 于是
 返回空 —— 表现就是**图片传上去了、文案一个字都没写进去，而回执却照样打
 「文案：xxx」**。现在改为扫全树收候选，并用「batchId 是秒级时间戳、刚上传的那批
 必然贴近当前时间」来挑出本次上传的那条，逐个候选尝试，最后**如实回执**成败。
+
+⚠️ 建相册 / 删相册：协议端目前没有这个 action
+----------------------------------------------
+NapCat 的内核（``NodeIKernelAlbumService``）里有 ``addAlbum`` / ``deleteAlbum``，
+但 OneBot 层**没有把它们暴露成 action**：截至当前 main 分支，``router.ts`` 的
+ActionName 里相册相关的只有 ``get_qun_album_list``、``get_group_album_media_list``、
+``upload_image_to_qun_album``、``upload_images_to_qun_album``、
+``upload_video_to_qun_album``、``do_group_album_comment``、
+``set_group_album_media_like``、``cancel_group_album_media_like``、
+``del_group_album_media``（删的是相册里的**媒体**，不是相册本身）。
+
+因此 :meth:`GroupAlbumUploader.create_album` / :meth:`delete_album` 的做法是
+**候选 action 逐个探测**：哪个名字被协议端认得就用哪个（将来 NapCat 或某个分支
+补上了就自动生效），全都不认得时**如实回报**「协议端没有这个接口」并给出人工
+操作步骤，而不是假装建好了。建/删之后都会**重新拉一次相册列表做校验**，
+只有列表里真的出现/消失才算成功。
 """
 
 from __future__ import annotations
@@ -72,6 +88,7 @@ from __future__ import annotations
 import asyncio
 import base64
 import json
+import re
 import time
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -156,6 +173,109 @@ _MISSING_ACTION_HINTS = (
     "不支持",
     "未知动作",
 )
+
+#: 「创建群相册」的候选 action 名，按顺序探测，第一个被协议端认得的就用它。
+#:
+#: NapCat 当前（main 分支 router.ts）**没有**把建相册暴露成 OneBot action，
+#: 所以正常情况下这几个都会命中 1404，最终由 :meth:`create_album` 如实回报
+#: 「协议端没有这个接口」。留这份候选表是为了：一旦 NapCat 或某个分支/插件
+#: 按其中任一名字补上，本插件无需改代码即可生效。
+_CREATE_ALBUM_ACTIONS = (
+    "create_qun_album",
+    "create_group_album",
+    "add_qun_album",
+    "add_group_album",
+)
+
+#: 「删除群相册」的候选 action 名。注意 ``del_group_album_media`` 不在其中：
+#: 它删的是相册里的媒体，不是相册本身，语义不同不能顶替。
+_DELETE_ALBUM_ACTIONS = (
+    "delete_qun_album",
+    "del_qun_album",
+    "delete_group_album",
+    "del_group_album",
+)
+
+#: 相册名的长度上限，避免用户把一整句话当相册名
+MAX_ALBUM_NAME = 24
+
+#: 相册名两侧可能要剥掉的引号/括号
+_NAME_TRIM = "\"'“”‘’《》〈〉「」『』[]【】()（）"
+
+#: 相册名末尾可能要剥掉的标点
+_NAME_TAIL = re.compile(r"[\s。，,.!！?？;；:：]+$")
+
+
+# ================ 相册命令解析 ================
+#
+# 解析逻辑放在这里（而不是 main.py）是为了能被离线测试直接执行：main.py 一
+# import 就要拉起整个 AstrBot，本模块只需要一个日志桩，命令的边界用例（相册名
+# 里混进链接、把「/相册自检」当成上传到「自检」相册……）才测得到。
+
+ALBUM_HEAD = re.compile(r"^/?相册")
+"""群相册上传的命令头，相册名直接写在命令里：
+
+    /相册旅游 <链接>        上传到「旅游」
+    /相册少女集 <链接>      上传到「少女集」
+    /相册 <链接>            上传到配置项「默认相册名称」里的相册
+
+解析出的图片/视频会上传进该群相册，不会再往会话里发媒体本身。
+"""
+
+ALBUM_NAME_TOKEN = re.compile(r"^([^\s:：]{1,%d})[\s:：]*" % MAX_ALBUM_NAME)
+"""命令头后面紧跟的相册名，如「/相册旅游 <链接>」里的「旅游」"""
+
+_URLISH = re.compile(r"(https?|www\.|://)", re.IGNORECASE)
+"""判断一段文本是不是链接的开头，避免把「/相册https://x」里的 https 当成相册名"""
+
+ALBUM_RESERVED_NAMES = frozenset(
+    {"上传", "上传到相册", "自检", "检测", "列表", "清单", "帮助"}
+)
+"""这些词是别的命令或被忽略的写法，不能当相册名"""
+
+ALBUM_CREATE_CMD = re.compile(r"^/?创建相册[\s:：]*(.+)$")
+"""创建群相册命令：/创建相册旅游、/创建相册 吃喝玩乐"""
+
+ALBUM_DELETE_CMD = re.compile(r"^/?删除相册[\s:：]*(.+)$")
+"""删除群相册命令：/删除相册旅游（仅相册所有者可用）"""
+
+ALBUM_LIST_CMD = re.compile(r"^/?(?:相册列表|相册清单)$")
+"""列出群内相册：/相册列表"""
+
+
+def clean_album_name(raw: str) -> str:
+    """清理用户输入的相册名：剥掉两侧引号、末尾标点与空白"""
+    name = (raw or "").strip()
+    # 「旅游」。这种引号与标点交替出现的写法要剥好几轮才干净
+    for _ in range(4):
+        trimmed = _NAME_TAIL.sub("", name.strip(_NAME_TRIM).strip())
+        if trimmed == name:
+            break
+        name = trimmed
+    return name.strip()
+
+
+def split_album_command(text: str) -> tuple[str, str] | None:
+    """把「/相册<名字> <链接>」拆成 (相册名, 剩余文本)
+
+    相册名省略时名字为空串（调用方回落到配置里的默认相册）。不是相册命令时
+    返回 ``None``。
+
+    名字必须是**不含空白的短词**，所以「/相册 https://x」会被识别成「没写
+    相册名」，而不是把 ``https`` 当成相册名；「/相册自检」这类别的命令也不会
+    被当成「上传到『自检』相册」。
+    """
+    head = ALBUM_HEAD.match(text)
+    if head is None:
+        return None
+    rest = text[head.end() :]
+    token = ALBUM_NAME_TOKEN.match(rest)
+    if token is None:
+        return "", rest
+    name = token.group(1)
+    if _URLISH.search(name) or name in ALBUM_RESERVED_NAMES:
+        return "", rest
+    return name, rest[token.end() :]
 
 
 class AlbumError(Exception):
@@ -551,6 +671,149 @@ class GroupAlbumUploader:
             f"[album] 未命中目标相册「{self.name}」，群内相册：{[n for n, _ in named]}"
         )
         return None
+
+    async def list_albums(self, bot: Any, group_id: str) -> list[Album]:
+        """取回群内全部相册（名字或 ID 缺失的条目会被丢掉）
+
+        Raises:
+            AlbumError: 协议端不支持相册接口，或明确返回失败
+        """
+        items = await self._list_albums(bot, group_id)
+        albums: list[Album] = []
+        for item in items:
+            name = _first(item, _NAME_KEYS)
+            album_id = _first(item, _ID_KEYS)
+            if name and album_id:
+                albums.append(Album(album_id, name))
+        return albums
+
+    async def find_album_exact(self, bot: Any, group_id: str, name: str) -> Album | None:
+        """按名字**精确**匹配相册（不做包含匹配）
+
+        建/删相册必须有这个严格版本：包含匹配会把「旅游」命中到「旅游风景」上，
+        于是「删除相册旅游」有可能删掉另一个相册。
+        """
+        wanted = (name or "").strip()
+        if not wanted:
+            return None
+        for album in await self.list_albums(bot, group_id):
+            if album.name == wanted:
+                return album
+        return None
+
+    async def create_album(self, bot: Any, group_id: str, name: str) -> tuple[bool, str]:
+        """创建一个群相册
+
+        协议端支持与否用「候选 action 逐个探测」判定（见模块顶部说明）：哪个名字
+        被认得就用哪个；建完**重新拉一次相册列表**确认真的建出来了，接口假装
+        成功不算成功。
+
+        Returns:
+            tuple[bool, str]: 是否成功、面向用户的说明或失败原因
+        """
+        name = (name or "").strip()
+        if not name:
+            return False, "相册名不能为空"
+        if len(name) > MAX_ALBUM_NAME:
+            return False, f"相册名太长（上限 {MAX_ALBUM_NAME} 个字）"
+
+        try:
+            existing = await self.list_albums(bot, group_id)
+        except AlbumError as exc:
+            return False, str(exc)
+
+        if any(album.name == name for album in existing):
+            return True, f"相册「{name}」已经存在，无需创建"
+
+        detail = ""
+        for action in _CREATE_ALBUM_ACTIONS:
+            resp = await self._call_quiet(
+                bot, action, group_id=str(group_id), album_name=name
+            )
+            if self._ok(resp, void_ok=True):
+                if await self._album_verified(bot, group_id, name, want=True):
+                    logger.info(f"[album] 通过 {action} 创建相册「{name}」成功")
+                    return True, f"已创建群相册「{name}」"
+                return False, (
+                    f"{action} 返回成功，但相册列表里没有出现「{name}」，"
+                    "协议端可能没有真正执行；请到群相册里确认"
+                )
+            if self._is_missing_action(resp):
+                continue
+            detail = self._fail_reason(resp)
+            return False, f"创建相册失败：{detail}"
+
+        return False, (
+            "协议端没有提供「创建群相册」接口，无法用命令建相册。\n"
+            f"请在 QQ 群聊 → 群相册 → 新建相册，名字填「{name}」（建一次即可），"
+            f"之后就能用 /相册{name} + 链接 直接上传到它。"
+        )
+
+    async def delete_album(self, bot: Any, group_id: str, name: str) -> tuple[bool, str]:
+        """删除一个群相册（只删精确同名的那一个）
+
+        与 :meth:`create_album` 同样是候选 action 探测 + 删完复核，接口假装
+        成功不算成功。
+
+        Returns:
+            tuple[bool, str]: 是否成功、面向用户的说明或失败原因
+        """
+        name = (name or "").strip()
+        if not name:
+            return False, "相册名不能为空"
+
+        try:
+            existing = await self.list_albums(bot, group_id)
+        except AlbumError as exc:
+            return False, str(exc)
+
+        target = next((album for album in existing if album.name == name), None)
+        if target is None:
+            names = "、".join(album.name for album in existing) or "（一个都没有）"
+            return False, f"群里没有名为「{name}」的相册。现有相册：{names}"
+
+        last = ""
+        for action in _DELETE_ALBUM_ACTIONS:
+            resp = await self._call_quiet(
+                bot,
+                action,
+                group_id=str(group_id),
+                album_id=target.album_id,
+                album_name=target.name,
+            )
+            if self._ok(resp, void_ok=True):
+                if await self._album_verified(bot, group_id, name, want=False):
+                    logger.info(f"[album] 通过 {action} 删除相册「{name}」成功")
+                    return True, f"已删除群相册「{name}」"
+                return False, (
+                    f"{action} 返回成功，但相册列表里「{name}」仍然存在，"
+                    "协议端可能没有真正执行"
+                )
+            if self._is_missing_action(resp):
+                continue
+            last = self._fail_reason(resp)
+            return False, f"删除相册失败：{last}"
+
+        return False, (
+            "协议端没有提供「删除群相册」接口，无法用命令删相册。\n"
+            f"请在 QQ 群聊 → 群相册 → 长按「{name}」→ 删除。"
+        )
+
+    async def _album_verified(
+        self, bot: Any, group_id: str, name: str, *, want: bool
+    ) -> bool:
+        """复核相册是否真的建出来了 / 真的删掉了
+
+        只看接口返回会把「假装成功」当成成功，所以一律回列表里查一遍：
+        ``want=True`` 期望存在，``want=False`` 期望消失。列表读不到时按未通过处理。
+        """
+        try:
+            albums = await self.list_albums(bot, group_id)
+        except AlbumError as exc:
+            logger.warning(f"[album] 复核相册「{name}」时读取列表失败：{exc}")
+            return False
+        found = any(album.name == name for album in albums)
+        return found if want else not found
 
     async def album_names(self, bot: Any, group_id: str) -> list[str]:
         """列出群里已有相册名，用于报错时提示"""

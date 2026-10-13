@@ -107,10 +107,18 @@
         "default": true
     },
     "album_name": {
-        "description": "相册名称",
-        "hint": "目标群相册的名字，需与群相册里的名字一致（不会自动创建）。「/相册少女集」上传到该相册",
+        "description": "默认相册名称",
+        "hint": "命令里没写相册名时（如「/相册上传 + 链接」）用的相册。「/相册旅游 + 链接」会直接上传到「旅游」，可不必改本项",
         "type": "string",
         "default": "少女集"
+    },
+    "album_owner_ids": {
+        "description": "相册所有者",
+        "hint": "只有这些 QQ 能用「/删除相册 + 名字」。「/创建相册 + 名字」除所有者外，群主与群管理员也可用。默认 3556654921（流水）",
+        "type": "list",
+        "default": [
+            "3556654921"
+        ]
     },
     "album_title_comment": {
         "description": "把文案写入相册评论",

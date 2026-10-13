@@ -15,7 +15,17 @@ from astrbot.core.platform.sources.aiocqhttp.aiocqhttp_message_event import (
     AiocqhttpMessageEvent,
 )
 
-from .core.album import AlbumError, GroupAlbumUploader, UploadReport
+from .core.album import (
+    ALBUM_CREATE_CMD,
+    ALBUM_DELETE_CMD,
+    ALBUM_LIST_CMD,
+    MAX_ALBUM_NAME,
+    AlbumError,
+    GroupAlbumUploader,
+    UploadReport,
+    clean_album_name,
+    split_album_command,
+)
 from .core.arbiter import ArbiterContext, EmojiLikeArbiter
 from .core.clean import CacheCleaner
 from .core.config import PluginConfig
@@ -52,12 +62,21 @@ ALL_WORKS_PREFIX = re.compile(r"^/?全部[\s:：]*")
 ALL_MUSIC_PREFIX = re.compile(r"^/?全部音乐[\s:：]*")
 """主页音乐清单的触发前缀，如 "/全部音乐" 、"全部音乐" """
 
-ALBUM_PREFIX = re.compile(r"^/?相册少女集[\s:：]*")
-"""群相册上传的触发前缀，如 "/相册少女集 <链接>"
 
-解析出的图片/视频会上传到群相册（相册名见配置项「相册名称」），
-不会再往会话里发媒体本身。
-"""
+def _sender_role(event: AstrMessageEvent) -> str:
+    """取发送者在群里的角色：owner / admin / member
+
+    OneBot v11 的群消息事件里 ``sender.role`` 是权威来源。AstrBot 的
+    ``event.is_admin()`` 判的是**框架管理员**（配置里的 ``admins_id``），
+    跟「群主 / 群管理员」不是一回事，所以群角色必须直接读原始事件。
+    """
+    raw = getattr(event.message_obj, "raw_message", None)
+    if isinstance(raw, dict):
+        sender = raw.get("sender")
+        if isinstance(sender, dict):
+            return str(sender.get("role") or "").strip().lower()
+    return ""
+
 
 LIMIT_PARAM = re.compile(r"^(\d+)\s+")
 """清单条数参数，如 "/全部 10 <链接>"。要求数字后紧跟空白，
@@ -327,8 +346,114 @@ class ParserPlugin(Star):
                 videos.append(cont)
         return images, videos
 
-    async def _upload_to_album(self, event: AstrMessageEvent, parse_res: ParseResult):
-        """把解析结果上传到群相册，并回执结果
+    def _album_uploader(self, name: str | None = None) -> GroupAlbumUploader:
+        """按配置造一个群相册上传器（相册名可覆盖）"""
+        return GroupAlbumUploader(
+            name=name or self.cfg.album_name,
+            title_comment=self.cfg.album_title_comment,
+            base64_fallback=self.cfg.album_base64_fallback,
+            max_media=self.cfg.album_max_media,
+        )
+
+    def _is_album_owner(self, event: AstrMessageEvent) -> bool:
+        """是不是相册所有者（配置项「相册所有者」里的 QQ，默认流水本人）"""
+        return str(event.get_sender_id()) in set(self.cfg.album_owner_ids)
+
+    def _can_create_album(self, event: AstrMessageEvent) -> bool:
+        """「/创建相册」的权限：相册所有者、群主、群管理员、框架管理员"""
+        if self._is_album_owner(event):
+            return True
+        if _sender_role(event) in ("owner", "admin"):
+            return True
+        try:
+            return bool(event.is_admin())
+        except Exception as e:  # noqa: BLE001 - 判定不了就当没有权限
+            logger.debug(f"[album] is_admin 判定失败：{e}")
+            return False
+
+    async def _album_create_lines(self, event: AstrMessageEvent, name: str) -> str:
+        """「/创建相册<名字>」的正文"""
+        if not self.cfg.album_enabled:
+            return "相册命令已在插件配置里关闭（配置项「启用相册命令」）"
+        if not isinstance(event, AiocqhttpMessageEvent):
+            return "相册命令仅支持 QQ（NapCat）协议端"
+        group_id = event.get_group_id()
+        if not group_id:
+            return "请在群聊里使用「/创建相册」，私聊无法确定相册归属"
+        if not name:
+            return "用法：/创建相册 + 相册名，例如「/创建相册旅游」"
+        if len(name) > MAX_ALBUM_NAME:
+            return f"相册名太长（上限 {MAX_ALBUM_NAME} 个字）：{name}"
+        if not self._can_create_album(event):
+            return (
+                "「/创建相册」仅限群主、群管理员与相册所有者使用"
+                f"（当前 ID：{event.get_sender_id()}，群角色：{_sender_role(event) or '未知'}）"
+            )
+
+        try:
+            ok, detail = await self._album_uploader(name).create_album(
+                event.bot, str(group_id), name
+            )
+        except AlbumError as e:
+            return f"创建相册失败：{e}"
+        return ("✅ " if ok else "⚠️ ") + detail
+
+    async def _album_delete_lines(self, event: AstrMessageEvent, name: str) -> str:
+        """「/删除相册<名字>」的正文（只有相册所有者可用）"""
+        if not self.cfg.album_enabled:
+            return "相册命令已在插件配置里关闭（配置项「启用相册命令」）"
+        if not isinstance(event, AiocqhttpMessageEvent):
+            return "相册命令仅支持 QQ（NapCat）协议端"
+        group_id = event.get_group_id()
+        if not group_id:
+            return "请在群聊里使用「/删除相册」，私聊无法确定相册归属"
+        if not name:
+            return "用法：/删除相册 + 相册名，例如「/删除相册旅游」"
+        if not self._is_album_owner(event):
+            return (
+                "「/删除相册」仅限相册所有者本人使用"
+                f"（当前 ID：{event.get_sender_id()}）"
+            )
+
+        try:
+            ok, detail = await self._album_uploader(name).delete_album(
+                event.bot, str(group_id), name
+            )
+        except AlbumError as e:
+            return f"删除相册失败：{e}"
+        return ("✅ " if ok else "⚠️ ") + detail
+
+    async def _album_list_lines(self, event: AstrMessageEvent) -> str:
+        """「/相册列表」的正文：列出群内相册名，供上传/删除命令对照"""
+        if not self.cfg.album_enabled:
+            return "相册命令已在插件配置里关闭（配置项「启用相册命令」）"
+        if not isinstance(event, AiocqhttpMessageEvent):
+            return "相册命令仅支持 QQ（NapCat）协议端"
+        group_id = event.get_group_id()
+        if not group_id:
+            return "请在群聊里使用「/相册列表」"
+
+        try:
+            albums = await self._album_uploader().list_albums(event.bot, str(group_id))
+        except AlbumError as e:
+            return f"读取群相册失败：{e}"
+
+        if not albums:
+            return (
+                "群里还没有相册。\n"
+                "可用「/创建相册 + 名字」建一个（需群主/群管理员/相册所有者，"
+                "且协议端暴露了建相册接口）；也可以在群相册里手动新建。"
+            )
+
+        lines = [f"群相册共 {len(albums)} 个："]
+        lines += [f"{index}. {album.name}" for index, album in enumerate(albums, 1)]
+        lines.append(f"上传用法：/相册{albums[0].name} + 链接")
+        return "\n".join(lines)
+
+    async def _upload_to_album(
+        self, event: AstrMessageEvent, parse_res: ParseResult, album_name: str
+    ):
+        """把解析结果上传到指定群相册，并回执结果
 
         抖音实况：静态图按图片上传，实况 mp4 按视频上传；NapCat 版本过旧
         没有视频接口时自动退化为上传视频封面。整个过程不往会话里发媒体。
@@ -336,6 +461,10 @@ class ParserPlugin(Star):
         图片走 NapCat 的「一次传多张」，同批共用 batchId，相册里**合并成
         一条说说**（也就是用户要的「一条装齐所有图／视频 + 文案」）；视频走
         独立的视频链路，NapCat 不支持把视频并进图片批次里，因此视频各自成贴。
+
+        Args:
+            album_name: 目标相册名，由「/相册<名字>」命令解析而来，
+                省略时是配置项「默认相册名称」
         """
         if not isinstance(event, AiocqhttpMessageEvent):
             yield event.plain_result("群相册上传仅支持 QQ（NapCat）协议端")
@@ -344,17 +473,12 @@ class ParserPlugin(Star):
         group_id = event.get_group_id()
         if not group_id:
             yield event.plain_result(
-                "请在群聊里使用「/相册少女集」，私聊无法确定相册归属"
+                f"请在群聊里使用「/相册{album_name}」，私聊无法确定相册归属"
             )
             return
 
         bot = event.bot
-        uploader = GroupAlbumUploader(
-            name=self.cfg.album_name,
-            title_comment=self.cfg.album_title_comment,
-            base64_fallback=self.cfg.album_base64_fallback,
-            max_media=self.cfg.album_max_media,
-        )
+        uploader = self._album_uploader(album_name)
 
         try:
             album = await uploader.find_album(bot, str(group_id))
@@ -365,19 +489,19 @@ class ParserPlugin(Star):
         if album is None:
             names = await uploader.album_names(bot, str(group_id))
             if names:
-                tip = (
-                    "群里现有相册：" + "、".join(names) + "\n"
-                    f"把插件配置里的「相册名称」改成上面其中之一即可。"
-                )
+                tip = "群里现有相册：" + "、".join(names)
             else:
                 tip = (
                     "没有读到任何群相册，请确认：\n"
-                    "· 群相册里确实已创建该相册，名称与配置完全一致\n"
-                    "· 协议端为 NapCat 且版本 ≥ v4.18.30\n"
-                    "管理员可用 /相册自检 查看逐项探测结果。"
+                    "· 群相册里确实已创建该相册，名称与命令里写的完全一致\n"
+                    "· 协议端为 NapCat 且版本 ≥ v4.18.30"
                 )
             yield event.plain_result(
-                f"没有找到名为「{self.cfg.album_name}」的群相册。\n{tip}"
+                f"没有找到名为「{album_name}」的群相册。\n{tip}\n"
+                f"可以让群主/群管理员用「/创建相册{album_name}」建一个"
+                "（需协议端支持建相册，NapCat 目前未开放该接口，"
+                "这种情况下请在群相册里手动新建一次）；"
+                "管理员可用 /相册自检 查看逐项探测结果。"
             )
             return
 
@@ -484,6 +608,23 @@ class ParserPlugin(Star):
             yield event.plain_result(await self._shortlink_lines())
             return
 
+        # -------- 群相册管理命令 --------
+        # 必须排在「/相册<名字>」上传命令之前，否则「/相册自检」「相册列表」
+        # 会被当成「上传到名叫『自检』的相册」而走错分支。
+        if ALBUM_LIST_CMD.match(cmd):
+            yield event.plain_result(await self._album_list_lines(event))
+            return
+        if matched := ALBUM_CREATE_CMD.match(cmd):
+            yield event.plain_result(
+                await self._album_create_lines(event, clean_album_name(matched.group(1)))
+            )
+            return
+        if matched := ALBUM_DELETE_CMD.match(cmd):
+            yield event.plain_result(
+                await self._album_delete_lines(event, clean_album_name(matched.group(1)))
+            )
+            return
+
         # 白名单
         if self.cfg.whitelist and umo not in self.cfg.whitelist:
             return
@@ -500,11 +641,14 @@ class ParserPlugin(Star):
         seg1 = chain[0]
         text = event.message_str
 
-        # 群相册上传："/相册少女集 <链接>" 时剥离前缀，解析后上传到群相册
+        # 群相册上传："/相册<名字> <链接>" 时剥离命令头，解析后上传到该相册；
+        # 名字省略时回落到配置项「默认相册名称」
         album_upload = False
-        if self.cfg.album_enabled and (prefix := ALBUM_PREFIX.match(text)):
+        album_name = self.cfg.album_name
+        if self.cfg.album_enabled and (parsed := split_album_command(text)):
             album_upload = True
-            text = text[prefix.end() :]
+            name, text = parsed
+            album_name = name or self.cfg.album_name
 
         # 仅解析音频："/音乐 <链接>" 时剥离前缀，只发送音频
         audio_only = False
@@ -661,7 +805,7 @@ class ParserPlugin(Star):
 
         # 上传到群相册：只回执结果，不往会话里发媒体本身
         if album_upload:
-            async for res in self._upload_to_album(event, parse_res):
+            async for res in self._upload_to_album(event, parse_res, album_name):
                 yield res
             return
 
@@ -723,8 +867,26 @@ class ParserPlugin(Star):
 
     @filter.command("相册少女集", alias={"相册上传"})
     async def album_upload_parser(self, event: AstrMessageEvent):
-        """上传到群相册：/相册少女集 <链接>"""
+        """上传到群相册：/相册<名字> <链接>，名字省略时用配置里的默认相册"""
         # 实际解析与上传由 on_message 统一完成，此函数仅用于注册命令
+        pass
+
+    @filter.command("创建相册")
+    async def album_create_parser(self, event: AstrMessageEvent):
+        """创建群相册：/创建相册<名字>（群主/群管理员/相册所有者）"""
+        # 实际输出由 on_message 统一完成，此函数仅用于注册命令
+        pass
+
+    @filter.command("删除相册")
+    async def album_delete_parser(self, event: AstrMessageEvent):
+        """删除群相册：/删除相册<名字>（仅相册所有者）"""
+        # 实际输出由 on_message 统一完成，此函数仅用于注册命令
+        pass
+
+    @filter.command("相册列表")
+    async def album_list_parser(self, event: AstrMessageEvent):
+        """列出群内相册：/相册列表"""
+        # 实际输出由 on_message 统一完成，此函数仅用于注册命令
         pass
 
     @filter.permission_type(filter.PermissionType.ADMIN)
@@ -750,13 +912,8 @@ class ParserPlugin(Star):
 
         bot = event.bot
         gid = str(group_id)
-        uploader = GroupAlbumUploader(
-            name=self.cfg.album_name,
-            title_comment=self.cfg.album_title_comment,
-            base64_fallback=self.cfg.album_base64_fallback,
-            max_media=self.cfg.album_max_media,
-        )
-        lines = [f"相册自检（群 {gid}）", f"目标相册：{self.cfg.album_name}"]
+        uploader = self._album_uploader()
+        lines = [f"相册自检（群 {gid}）", f"默认相册：{self.cfg.album_name}"]
 
         try:
             names = await uploader.album_names(bot, gid)
