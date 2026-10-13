@@ -976,6 +976,20 @@ class ParserPlugin(Star):
                         "文案无法写入，请把本行所在日志发给作者"
                     )
 
+        # 建/删相册的两条通路：候选 action 是否被认得 + 原始发包后端是否可用。
+        # 这两处是「/创建相册 为什么失败」的一手证据。
+        for label, action in (("建相册 action", "create_group_album"),
+                              ("删相册 action", "delete_group_album")):
+            ok, reason = await uploader.probe(bot, action, group_id=gid, name="")
+            lines.append(f"[{'通过' if ok else '失败'}] {label}：{'可用' if ok else reason}")
+
+        packet_ok, packet_reason = await uploader.packet_ready(bot)
+        lines.append(
+            "原始发包（packetBackend）：可用 —— 建/删相册可走这条路"
+            if packet_ok
+            else f"原始发包（packetBackend）不可用：{packet_reason}"
+        )
+
         return "\n".join(lines)
 
     def _enabled_platform_names(self) -> list[str]:

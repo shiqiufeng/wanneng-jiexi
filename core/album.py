@@ -66,21 +66,38 @@ OneBot 信封里 ``data: undefined`` 序列化后直接消失，aiocqhttp 于是
 「文案：xxx」**。现在改为扫全树收候选，并用「batchId 是秒级时间戳、刚上传的那批
 必然贴近当前时间」来挑出本次上传的那条，逐个候选尝试，最后**如实回执**成败。
 
-⚠️ 建相册 / 删相册：协议端目前没有这个 action
-----------------------------------------------
-NapCat 的内核（``NodeIKernelAlbumService``）里有 ``addAlbum`` / ``deleteAlbum``，
-但 OneBot 层**没有把它们暴露成 action**：截至当前 main 分支，``router.ts`` 的
+⚠️ 建相册 / 删相册：靠「原始发包」补齐
+--------------------------------------
+群相册在内核里走的不是 OIDB，而是 qzone 的 **trpc** 服务：
+
+    QunAlbum.trpc.qzone.webapp_qun_media.QunMedia.GetAlbumList   列相册
+    QunAlbum.trpc.qzone.webapp_qun_media.QunMedia.GetMediaList   列媒体
+    QunAlbum.trpc.qzone.webapp_qun_media.QunMedia.AddAlbum       建相册
+    QunAlbum.trpc.qzone.webapp_qun_media.QunMedia.DeleteAlbum    删相册
+
+NapCat 的内核（``NodeIKernelAlbumService``）里声明了 ``addAlbum`` /
+``deleteAlbum``，但 OneBot 层**没有把它们暴露成 action**：``router.ts`` 的
 ActionName 里相册相关的只有 ``get_qun_album_list``、``get_group_album_media_list``、
 ``upload_image_to_qun_album``、``upload_images_to_qun_album``、
 ``upload_video_to_qun_album``、``do_group_album_comment``、
 ``set_group_album_media_like``、``cancel_group_album_media_like``、
 ``del_group_album_media``（删的是相册里的**媒体**，不是相册本身）。
 
-因此 :meth:`GroupAlbumUploader.create_album` / :meth:`delete_album` 的做法是
-**候选 action 逐个探测**：哪个名字被协议端认得就用哪个（将来 NapCat 或某个分支
-补上了就自动生效），全都不认得时**如实回报**「协议端没有这个接口」并给出人工
-操作步骤，而不是假装建好了。建/删之后都会**重新拉一次相册列表做校验**，
-只有列表里真的出现/消失才算成功。
+于是 :meth:`GroupAlbumUploader.create_album` / :meth:`delete_album` 走三级回退：
+
+1. **候选 action 逐个探测**（参数名也逐个形状试）。LLOneBot 就有
+   ``create_group_album`` / ``delete_group_album``，本插件的候选表已经覆盖；
+   哪天 NapCat 或某个分支补上，同样无需改代码即生效。
+2. **NapCat 原始发包**：``send_packet`` 允许直接发一条 PB 包（cmd + protobuf
+   十六进制体）。客户端本来就会发 AddAlbum / DeleteAlbum 这两条包，把它们原样
+   造出来发出去即可 —— 这条通路不依赖协议端补 action。发之前先用
+   ``get_packet_status`` 探活（PacketBackend 被禁用或当前 QQ 版本/架构不受支持
+   时它会直接拒绝，原话带官方文档链接，原样透给用户）。
+3. 都不行时**如实回报**「协议端没有这个接口」并给出人工操作步骤。
+
+无论走哪条路，建/删之后都会**重新拉一次相册列表做校验**：接口说成功但列表里
+没出现（或没消失）就判失败，绝不假装建好了。响应的 retCode / retMsg 会被解析
+出来写进回执，方便定位「权限不足」「相册名重复」这类服务端拒绝。
 """
 
 from __future__ import annotations
@@ -88,6 +105,7 @@ from __future__ import annotations
 import asyncio
 import base64
 import json
+import random
 import re
 import time
 from dataclasses import dataclass, field
@@ -176,10 +194,11 @@ _MISSING_ACTION_HINTS = (
 
 #: 「创建群相册」的候选 action 名，按顺序探测，第一个被协议端认得的就用它。
 #:
-#: NapCat 当前（main 分支 router.ts）**没有**把建相册暴露成 OneBot action，
-#: 所以正常情况下这几个都会命中 1404，最终由 :meth:`create_album` 如实回报
-#: 「协议端没有这个接口」。留这份候选表是为了：一旦 NapCat 或某个分支/插件
-#: 按其中任一名字补上，本插件无需改代码即可生效。
+#: NapCat（main 分支 router.ts）**没有**把建相册暴露成 OneBot action，
+#: 但 LLOneBot 有 ``create_group_album``（见其
+#: ``src/onebot11/action/llbot/group/GroupAlbum/CreateGroupAlbum.ts``），
+#: 所以这份候选表在 LLOneBot 上是真能命中的；哪天 NapCat 或某个分支按其中
+#: 任一名字补上，本插件无需改代码即生效。全都不认得时才退到原始发包通路。
 _CREATE_ALBUM_ACTIONS = (
     "create_qun_album",
     "create_group_album",
@@ -187,13 +206,53 @@ _CREATE_ALBUM_ACTIONS = (
     "add_group_album",
 )
 
-#: 「删除群相册」的候选 action 名。注意 ``del_group_album_media`` 不在其中：
-#: 它删的是相册里的媒体，不是相册本身，语义不同不能顶替。
+#: 「删除群相册」的候选 action 名。LLOneBot 用的是 ``delete_group_album``。
+#: 注意 ``del_group_album_media`` 不在其中：它删的是相册里的媒体，不是相册
+#: 本身，语义不同不能顶替。
 _DELETE_ALBUM_ACTIONS = (
     "delete_qun_album",
     "del_qun_album",
     "delete_group_album",
     "del_group_album",
+)
+
+#: 各协议端的**参数名**也不一样（LLOneBot：``group_id + name + desc``；
+#: 别的实现可能叫 ``album_name`` / ``group_name``），因此每个 action 名字都
+#: 按这几种形状依次试，命中「参数不对」就换下一种，命中「没这个 action」就换
+#: 下一个名字。
+_CREATE_ALBUM_PARAMS: tuple[tuple[str, ...], ...] = (
+    ("group_id", "name", "desc"),
+    ("group_id", "album_name"),
+    ("group_id", "group_name"),
+    ("group_id", "name"),
+    ("group_id", "album_name", "name"),
+)
+
+_DELETE_ALBUM_PARAMS: tuple[tuple[str, ...], ...] = (
+    ("group_id", "album_id"),
+    ("group_id", "album_name"),
+    ("group_id", "album_id", "album_name"),
+    ("group_id", "name"),
+)
+
+#: 判定「这次失败只是参数名/参数个数不对」的线索：换一个参数形状再试，
+#: 而不是当成真正的失败回报。故意不收录「缺少」这类泛化词，避免把
+#: 「缺少权限」误判成参数问题。
+#:
+#: 这几条覆盖了常见协议端框架的参数校验措辞：TypeBox/ajv 的
+#: ``must have required property``、LLOneBot Schema 的 ``unexpected property``、
+#: 以及 ``unknown field`` 这类手写校验。
+_PARAM_ERROR_HINTS = (
+    "missing",
+    "required",
+    "invalid",
+    "unexpected",
+    "unknown field",
+    "unknown property",
+    "additional propert",
+    "schema",
+    "参数",
+    "不能为空",
 )
 
 #: 相册名的长度上限，避免用户把一整句话当相册名
@@ -276,6 +335,268 @@ def split_album_command(text: str) -> tuple[str, str] | None:
     if _URLISH.search(name) or name in ALBUM_RESERVED_NAMES:
         return "", rest
     return name, rest[token.end() :]
+
+
+# ================ 建 / 删相册：trpc 原始发包 ================
+#
+# 群相册走的是 qzone 的 trpc 服务 ``QunAlbum.trpc.qzone.webapp_qun_media.QunMedia``
+# （列相册 GetAlbumList、列媒体 GetMediaList、建相册 AddAlbum、删相册
+# DeleteAlbum）。NapCat 的内核声明了 addAlbum / deleteAlbum 却没包成 OneBot
+# action，但它提供了通用通道 ``send_packet``（cmd + protobuf 十六进制体），
+# 把客户端本来就会发的这两条包原样造出来即可。
+#
+# 服务名与字段号的依据（三处独立来源互相印证）：
+#   * LLOneBot ``src/main/qqProtocol/direct-lib/cmd.ts``：
+#       CreateAlbum: 'QunAlbum.trpc.qzone.webapp_qun_media.QunMedia.AddAlbum'
+#       DeleteAlbum: 'QunAlbum.trpc.qzone.webapp_qun_media.QunMedia.DeleteAlbum'
+#   * LLOneBot ``src/main/qqProtocol/mixins/group.ts``：AddAlbumReq 的字段装配
+#     （requestId / 空 field2,3 / body.info{groupCode,name,desc,field5=0} /
+#      sessionId / headers[fc-appid=100]）
+#   * SnowLuma ``packages/proto-defs/src/oidb-actions/group-album.ts``：从 QQ NT
+#     AlbumService codec 还原出的同名服务（``…QunMedia.GetAlbumList``）
+
+_QUN_ALBUM_TRPC = "QunAlbum.trpc.qzone.webapp_qun_media.QunMedia"
+
+#: 建相册 / 删相册的 trpc 命令字
+TRPC_ADD_ALBUM = f"{_QUN_ALBUM_TRPC}.AddAlbum"
+TRPC_DELETE_ALBUM = f"{_QUN_ALBUM_TRPC}.DeleteAlbum"
+
+#: NapCat 的通用发包 action 与发包探活 action
+PACKET_SEND_ACTION = "send_packet"
+PACKET_STATUS_ACTION = "get_packet_status"
+
+#: 请求头，与 QQ NT 客户端发出的包一致
+_ALBUM_APPID_HEADER = ("fc-appid", "100")
+
+#: 发包后隔多久再去复核相册列表（服务端落库有延迟）
+PACKET_VERIFY_DELAY = 1.5
+
+#: 复核最多看几次（每次间隔 PACKET_VERIFY_DELAY），避免「刚建好还没同步」被误判成失败
+PACKET_VERIFY_ATTEMPTS = 3
+
+
+def _pb_varint(value: int) -> bytes:
+    """protobuf varint（只处理非负整数，够用）"""
+    out = bytearray()
+    number = max(0, int(value)) & 0xFFFFFFFF
+    while True:
+        chunk = number & 0x7F
+        number >>= 7
+        if number:
+            out.append(chunk | 0x80)
+        else:
+            out.append(chunk)
+            return bytes(out)
+
+
+def _pb_field(field_no: int, wire: int) -> bytes:
+    return _pb_varint((field_no << 3) | wire)
+
+
+def _pb_uint(field_no: int, value: int) -> bytes:
+    """varint 字段"""
+    return _pb_field(field_no, 0) + _pb_varint(value)
+
+
+def _pb_raw(field_no: int, raw: bytes) -> bytes:
+    """length-delimited 字段（bytes / string / 嵌套 message 都是它）"""
+    return _pb_field(field_no, 2) + _pb_varint(len(raw)) + raw
+
+
+def _pb_text(field_no: int, text: str) -> bytes:
+    return _pb_raw(field_no, (text or "").encode("utf-8"))
+
+
+def _pb_album_headers() -> bytes:
+    """field 10（repeated QunAlbumMetaHeader）：每条是 {1 name, 2 value}"""
+    name, value = _ALBUM_APPID_HEADER
+    return _pb_raw(10, _pb_text(1, name) + _pb_text(2, value))
+
+
+def _pb_envelope(body: bytes) -> bytes:
+    """外层公共信封：1 requestId / 2,3 空 bytes / 4 body / 5 sessionId / 10 headers"""
+    return (
+        _pb_uint(1, random.randint(1, 0x7FFFFFFF))
+        + _pb_raw(2, b"")
+        + _pb_raw(3, b"")
+        + _pb_raw(4, body)
+        + _pb_text(5, album_session_id())
+        + _pb_album_headers()
+    )
+
+
+def album_session_id(now: float | None = None, rand: int | None = None) -> str:
+    """客户端会话号 ``_MMDDHHmmssSSS_xxxxx``（与 QQ NT 客户端同构）
+
+    Args:
+        now: 时间戳，测试时注入固定值
+        rand: 随机尾巴，测试时注入固定值
+    """
+    stamp = time.time() if now is None else float(now)
+    lt = time.localtime(stamp)
+    millis = int((stamp - int(stamp)) * 1000)
+    tail = random.randint(10000, 99999) if rand is None else int(rand)
+    return "_%02d%02d%02d%02d%02d%03d_%05d" % (
+        lt.tm_mon,
+        lt.tm_mday,
+        lt.tm_hour,
+        lt.tm_min,
+        lt.tm_sec,
+        millis,
+        tail,
+    )
+
+
+def build_create_album_payload(group_id: str, name: str, desc: str = "") -> str:
+    """拼 ``QunMedia.AddAlbum`` 请求体 → 十六进制字符串
+
+    字段号对照 QQ NT 内核 AlbumService（LLOneBot ``Action.AddAlbumReq``）：
+
+        1  requestId   uint32
+        2  field2      bytes（空）
+        3  field3      bytes（空）
+        4  body        { 1 info { 2 groupCode, 3 name, 4 desc, 5 uint32=0 } }
+        5  sessionId   string
+        10 headers     repeated { 1 name, 2 value }
+    """
+    info = (
+        _pb_text(2, str(group_id))
+        + _pb_text(3, name)
+        + _pb_text(4, desc or "")
+        + _pb_uint(5, 0)
+    )
+    return _pb_envelope(_pb_raw(1, info)).hex()
+
+
+def build_delete_album_payload(group_id: str, album_id: str) -> str:
+    """拼 ``QunMedia.DeleteAlbum`` 请求体 → 十六进制字符串
+
+    与建相册同一个信封，body 换成 ``{ 1 groupCode, 2 albumId }``。
+    """
+    body = _pb_text(1, str(group_id)) + _pb_text(2, album_id)
+    return _pb_envelope(body).hex()
+
+
+def _pb_read_varint(raw: bytes, pos: int) -> tuple[int | None, int]:
+    """读一个 varint，返回 (值, 新位置)；越界或过长返回 (None, 位置)"""
+    value = 0
+    shift = 0
+    while pos < len(raw) and shift <= 63:
+        byte = raw[pos]
+        pos += 1
+        value |= (byte & 0x7F) << shift
+        if not byte & 0x80:
+            return value, pos
+        shift += 7
+    return None, pos
+
+
+def parse_pb(raw: bytes | None) -> dict[int, list[Any]]:
+    """最小 protobuf 解析：把顶层字段扫成 ``{字段号: [值, ...]}``
+
+    varint 变成 int，length-delimited 变成 bytes。只吃这两种线格式（响应里也只
+    用得到这两种），遇到别的直接停，绝不抛异常 —— 解析失败按「没解析出东西」
+    处理，成败最终仍由相册列表复核决定。
+    """
+    fields: dict[int, list[Any]] = {}
+    if not raw:
+        return fields
+    pos = 0
+    size = len(raw)
+    while pos < size:
+        key, pos = _pb_read_varint(raw, pos)
+        if key is None:
+            break
+        wire = key & 0x07
+        if wire == 0:
+            value, pos = _pb_read_varint(raw, pos)
+            if value is None:
+                break
+            fields.setdefault(key >> 3, []).append(value)
+        elif wire == 2:
+            length, pos = _pb_read_varint(raw, pos)
+            if length is None or pos + length > size:
+                break
+            fields.setdefault(key >> 3, []).append(raw[pos : pos + length])
+            pos += length
+        else:
+            break  # 定长/deprecated group 不在响应里，遇到就停
+    return fields
+
+
+def _pb_first(fields: dict[int, list[Any]], field_no: int) -> Any:
+    values = fields.get(field_no)
+    return values[0] if values else None
+
+
+def parse_album_packet_response(raw: bytes | None) -> tuple[int, str, str]:
+    """从 AddAlbum / DeleteAlbum 的响应里取 ``(retCode, retMsg, albumId)``
+
+    响应结构（LLOneBot ``AddAlbumResp``）：
+    ``2 retCode`` / ``3 retMsg`` / ``4 body { 1 info { 1 albumId, … } }``。
+
+    空响应按「成功」处理（``(0, "", "")``）：成败最终以相册列表复核为准，
+    这里解析只是为了把服务端的拒绝原因说清楚。
+    """
+    fields = parse_pb(raw)
+    code = _pb_first(fields, 2)
+    message = _pb_first(fields, 3)
+    text = (
+        message.decode("utf-8", "ignore")
+        if isinstance(message, (bytes, bytearray))
+        else str(message or "")
+    )
+
+    album_id = ""
+    body = _pb_first(fields, 4)
+    if isinstance(body, (bytes, bytearray)):
+        info = _pb_first(parse_pb(bytes(body)), 1)
+        if isinstance(info, (bytes, bytearray)):
+            candidate = _pb_first(parse_pb(bytes(info)), 1)
+            if isinstance(candidate, (bytes, bytearray)):
+                album_id = candidate.decode("utf-8", "ignore")
+
+    try:
+        return int(code or 0), text.strip(), album_id
+    except (TypeError, ValueError):
+        return 0, text.strip(), album_id
+
+
+def hex_response_to_bytes(resp: Any) -> bytes | None:
+    """把 ``send_packet`` 的响应（十六进制字符串）转成 bytes
+
+    故意不复用 :meth:`GroupAlbumUploader._payload`：那个是给 JSON 响应用的，
+    形如 ``123456`` 的纯十六进制串会被 ``json.loads`` 当成整数解析，字节就丢了。
+    """
+    if isinstance(resp, (bytes, bytearray)):
+        return bytes(resp)
+    if isinstance(resp, dict) and "data" in resp and any(
+        key in resp for key in ("status", "retcode", "wording", "stream")
+    ):
+        resp = resp["data"]
+    if isinstance(resp, str):
+        text = resp.strip()
+        if text and len(text) % 2 == 0 and all(c in "0123456789abcdefABCDEF" for c in text):
+            try:
+                return bytes.fromhex(text)
+            except ValueError:
+                return None
+    return None
+
+
+def album_action_kwargs(
+    names: tuple[str, ...], *, group_id: str, name: str, album_id: str = ""
+) -> dict[str, Any]:
+    """按给定的参数名列表拼一次 ``call_action`` 的关键字参数"""
+    values = {
+        "group_id": str(group_id),
+        "name": name,
+        "album_name": name,
+        "group_name": name,
+        "album_id": album_id,
+        "desc": "",
+    }
+    return {key: values[key] for key in names if key in values}
 
 
 class AlbumError(Exception):
@@ -419,6 +740,11 @@ class GroupAlbumUploader:
         if getattr(exc, "retcode", None) == 1404 or any(
             hint in lowered for hint in _MISSING_ACTION_HINTS
         ):
+            if action in (PACKET_SEND_ACTION, PACKET_STATUS_ACTION):
+                return (
+                    f"协议端不支持 {action}（原始发包需要 NapCat，"
+                    "并在配置里启用 packetBackend）"
+                )
             return f"协议端不支持 {action}（群相册需要 NapCat v4.18.30+）"
         return f"{action} 调用异常：{exc}"
 
@@ -491,6 +817,17 @@ class GroupAlbumUploader:
         return "不支持" in text or any(
             hint in lowered for hint in _MISSING_ACTION_HINTS
         )
+
+    @staticmethod
+    def _is_param_error(reason: Any) -> bool:
+        """判断失败原因是不是「只是参数名/参数个数不对」
+
+        这类失败说明 action **是存在的**，只是我们猜的参数名不对，应该换一种
+        参数形状再试，而不是当成真正的失败回报给用户。
+        """
+        text = reason if isinstance(reason, str) else GroupAlbumUploader._fail_reason(reason)
+        lowered = text.lower()
+        return any(hint in lowered for hint in _PARAM_ERROR_HINTS)
 
     @staticmethod
     def _is_transient(resp_or_reason: Any) -> bool:
@@ -704,9 +1041,10 @@ class GroupAlbumUploader:
     async def create_album(self, bot: Any, group_id: str, name: str) -> tuple[bool, str]:
         """创建一个群相册
 
-        协议端支持与否用「候选 action 逐个探测」判定（见模块顶部说明）：哪个名字
-        被认得就用哪个；建完**重新拉一次相册列表**确认真的建出来了，接口假装
-        成功不算成功。
+        三级回退（见模块顶部说明）：候选 action 逐个名字×逐个参数形状试 →
+        NapCat 原始发包（``send_packet`` 发 trpc ``QunMedia.AddAlbum``）→
+        如实回报 + 人工步骤。建完**重新拉一次相册列表**确认真的建出来了，
+        接口假装成功不算成功。
 
         Returns:
             tuple[bool, str]: 是否成功、面向用户的说明或失败原因
@@ -725,26 +1063,38 @@ class GroupAlbumUploader:
         if any(album.name == name for album in existing):
             return True, f"相册「{name}」已经存在，无需创建"
 
-        detail = ""
         for action in _CREATE_ALBUM_ACTIONS:
-            resp = await self._call_quiet(
-                bot, action, group_id=str(group_id), album_name=name
-            )
-            if self._ok(resp, void_ok=True):
-                if await self._album_verified(bot, group_id, name, want=True):
-                    logger.info(f"[album] 通过 {action} 创建相册「{name}」成功")
-                    return True, f"已创建群相册「{name}」"
-                return False, (
-                    f"{action} 返回成功，但相册列表里没有出现「{name}」，"
-                    "协议端可能没有真正执行；请到群相册里确认"
+            for names in _CREATE_ALBUM_PARAMS:
+                resp = await self._call_quiet(
+                    bot,
+                    action,
+                    **album_action_kwargs(
+                        names, group_id=str(group_id), name=name
+                    ),
                 )
-            if self._is_missing_action(resp):
-                continue
-            detail = self._fail_reason(resp)
-            return False, f"创建相册失败：{detail}"
+                if self._ok(resp, void_ok=True):
+                    if await self._album_verified(bot, group_id, name, want=True):
+                        logger.info(f"[album] 通过 {action} 创建相册「{name}」成功")
+                        return True, f"已创建群相册「{name}」"
+                    return False, (
+                        f"{action} 返回成功，但相册列表里没有出现「{name}」，"
+                        "协议端可能没有真正执行；请到群相册里确认"
+                    )
+                if self._is_missing_action(resp):
+                    break  # 这个 action 名字协议端不认，换下一个名字
+                reason = self._fail_reason(resp)
+                if self._is_param_error(reason):
+                    continue  # 只是参数名/个数不对，换一种形状再试
+                return False, f"创建相册失败：{reason}"
 
+        # 协议端没把建相册暴露成 action：改发原始包（NapCat 可走通）
+        ok, detail = await self._create_album_by_packet(bot, group_id, name)
+        if ok:
+            return True, detail
         return False, (
-            "协议端没有提供「创建群相册」接口，无法用命令建相册。\n"
+            "无法用命令建相册。协议端的 OneBot 层没有建相册 action"
+            f"（已试过 {'、'.join(_CREATE_ALBUM_ACTIONS)}），原始发包通路也不可用。\n"
+            f"· {detail}\n"
             f"请在 QQ 群聊 → 群相册 → 新建相册，名字填「{name}」（建一次即可），"
             f"之后就能用 /相册{name} + 链接 直接上传到它。"
         )
@@ -752,8 +1102,7 @@ class GroupAlbumUploader:
     async def delete_album(self, bot: Any, group_id: str, name: str) -> tuple[bool, str]:
         """删除一个群相册（只删精确同名的那一个）
 
-        与 :meth:`create_album` 同样是候选 action 探测 + 删完复核，接口假装
-        成功不算成功。
+        与 :meth:`create_album` 同样的三级回退 + 删完复核，接口假装成功不算成功。
 
         Returns:
             tuple[bool, str]: 是否成功、面向用户的说明或失败原因
@@ -772,48 +1121,160 @@ class GroupAlbumUploader:
             names = "、".join(album.name for album in existing) or "（一个都没有）"
             return False, f"群里没有名为「{name}」的相册。现有相册：{names}"
 
-        last = ""
         for action in _DELETE_ALBUM_ACTIONS:
-            resp = await self._call_quiet(
-                bot,
-                action,
-                group_id=str(group_id),
-                album_id=target.album_id,
-                album_name=target.name,
-            )
-            if self._ok(resp, void_ok=True):
-                if await self._album_verified(bot, group_id, name, want=False):
-                    logger.info(f"[album] 通过 {action} 删除相册「{name}」成功")
-                    return True, f"已删除群相册「{name}」"
-                return False, (
-                    f"{action} 返回成功，但相册列表里「{name}」仍然存在，"
-                    "协议端可能没有真正执行"
+            for names in _DELETE_ALBUM_PARAMS:
+                resp = await self._call_quiet(
+                    bot,
+                    action,
+                    **album_action_kwargs(
+                        names,
+                        group_id=str(group_id),
+                        name=target.name,
+                        album_id=target.album_id,
+                    ),
                 )
-            if self._is_missing_action(resp):
-                continue
-            last = self._fail_reason(resp)
-            return False, f"删除相册失败：{last}"
+                if self._ok(resp, void_ok=True):
+                    if await self._album_verified(bot, group_id, name, want=False):
+                        logger.info(f"[album] 通过 {action} 删除相册「{name}」成功")
+                        return True, f"已删除群相册「{name}」"
+                    return False, (
+                        f"{action} 返回成功，但相册列表里「{name}」仍然存在，"
+                        "协议端可能没有真正执行"
+                    )
+                if self._is_missing_action(resp):
+                    break
+                reason = self._fail_reason(resp)
+                if self._is_param_error(reason):
+                    continue
+                return False, f"删除相册失败：{reason}"
 
+        ok, detail = await self._delete_album_by_packet(bot, group_id, target)
+        if ok:
+            return True, detail
         return False, (
-            "协议端没有提供「删除群相册」接口，无法用命令删相册。\n"
+            "无法用命令删相册。协议端的 OneBot 层没有删相册 action"
+            f"（已试过 {'、'.join(_DELETE_ALBUM_ACTIONS)}），原始发包通路也不可用。\n"
+            f"· {detail}\n"
             f"请在 QQ 群聊 → 群相册 → 长按「{name}」→ 删除。"
         )
 
+    # ---------------- 建 / 删相册：原始发包通路 ----------------
+
+    async def packet_ready(self, bot: Any) -> tuple[bool, str]:
+        """探测 NapCat 的原始发包能力（PacketBackend）是否可用
+
+        ``get_packet_status`` 成功时返回空体；PacketBackend 被禁用、或当前 QQ
+        版本/架构不在支持表里时，NapCat 会在参数校验阶段直接拒绝，aiocqhttp 抛
+        ``ActionFailed``，这里把它的原话（含官方文档链接与错误堆栈）透给用户。
+        """
+        try:
+            await self._call(bot, PACKET_STATUS_ACTION)
+        except AlbumError as exc:
+            reason = str(exc)
+            # NapCat 拒绝时会把错误堆栈一起塞进消息里，回执只留前半段（含文档链接）
+            if len(reason) > 200:
+                reason = reason[:200].rstrip() + "…"
+            return False, reason
+        return True, ""
+
+    async def _send_album_packet(self, bot: Any, cmd: str, payload_hex: str) -> bytes | None:
+        """用 ``send_packet`` 发一条 trpc 包并取回响应字节
+
+        Args:
+            cmd: trpc 命令字，如 ``QunAlbum.trpc.qzone.webapp_qun_media.QunMedia.AddAlbum``
+            payload_hex: protobuf 请求体的十六进制
+
+        Returns:
+            bytes | None: 响应体（拿不到就是 None，按「无返回体」处理）
+        """
+        resp = await self._call(
+            bot, PACKET_SEND_ACTION, cmd=cmd, data=payload_hex, rsp=True
+        )
+        return hex_response_to_bytes(resp)
+
+    async def _create_album_by_packet(
+        self, bot: Any, group_id: str, name: str
+    ) -> tuple[bool, str]:
+        """发 ``QunMedia.AddAlbum`` 原始包建相册，并用相册列表复核"""
+        ready, why = await self.packet_ready(bot)
+        if not ready:
+            return False, why
+
+        payload = build_create_album_payload(str(group_id), name)
+        logger.info(
+            f"[album] 原始发包建相册「{name}」：cmd={TRPC_ADD_ALBUM} size={len(payload) // 2}B"
+        )
+        raw = await self._send_album_packet(bot, TRPC_ADD_ALBUM, payload)
+        code, message, album_id = parse_album_packet_response(raw)
+        # 一切以相册列表为准：返回码只用来解释失败原因，不用来决定成败 ——
+        # 万一响应体形态与预期不同（带了别的信封），也不会把建成功的相册
+        # 误报成失败。
+        if await self._album_verified(
+            bot, group_id, name, want=True, attempts=PACKET_VERIFY_ATTEMPTS
+        ):
+            logger.info(
+                f"[album] 原始发包建相册「{name}」成功"
+                f"（album_id={album_id or '未返回'}，返回码 {code}）"
+            )
+            return True, f"已创建群相册「{name}」"
+        if code:
+            return False, f"协议端拒绝了建相册请求：{message or f'错误码 {code}'}"
+        return False, (
+            "建相册请求已发给协议端（返回码 0），但相册列表里还没出现"
+            f"「{name}」，可能只是还没同步；稍后发 /相册列表 再看一次"
+        )
+
+    async def _delete_album_by_packet(
+        self, bot: Any, group_id: str, album: Album
+    ) -> tuple[bool, str]:
+        """发 ``QunMedia.DeleteAlbum`` 原始包删相册，并用相册列表复核"""
+        ready, why = await self.packet_ready(bot)
+        if not ready:
+            return False, why
+
+        payload = build_delete_album_payload(str(group_id), album.album_id)
+        logger.info(
+            f"[album] 原始发包删相册「{album.name}」"
+            f"（album_id={album.album_id}）：cmd={TRPC_DELETE_ALBUM}"
+        )
+        raw = await self._send_album_packet(bot, TRPC_DELETE_ALBUM, payload)
+        code, message, _ = parse_album_packet_response(raw)
+        # 同样以相册列表为准（返回码只解释失败原因）
+        if await self._album_verified(
+            bot, group_id, album.name, want=False, attempts=PACKET_VERIFY_ATTEMPTS
+        ):
+            logger.info(f"[album] 原始发包删相册「{album.name}」成功（返回码 {code}）")
+            return True, f"已删除群相册「{album.name}」"
+        if code:
+            return False, f"协议端拒绝了删相册请求：{message or f'错误码 {code}'}"
+        return False, (
+            f"删相册请求已发给协议端（返回码 0），但相册列表里「{album.name}」"
+            "仍然存在，可能只是还没同步；稍后发 /相册列表 再看一次"
+        )
+
     async def _album_verified(
-        self, bot: Any, group_id: str, name: str, *, want: bool
+        self, bot: Any, group_id: str, name: str, *, want: bool, attempts: int = 1
     ) -> bool:
         """复核相册是否真的建出来了 / 真的删掉了
 
         只看接口返回会把「假装成功」当成成功，所以一律回列表里查一遍：
         ``want=True`` 期望存在，``want=False`` 期望消失。列表读不到时按未通过处理。
+
+        ``attempts > 1`` 时每次间隔 :data:`PACKET_VERIFY_DELAY` 再查一遍 ——
+        原始发包通路发完立刻查列表有「还没落库」的可能，多等两次更准。
         """
-        try:
-            albums = await self.list_albums(bot, group_id)
-        except AlbumError as exc:
-            logger.warning(f"[album] 复核相册「{name}」时读取列表失败：{exc}")
-            return False
-        found = any(album.name == name for album in albums)
-        return found if want else not found
+        for attempt in range(max(1, int(attempts))):
+            if attempt:
+                await asyncio.sleep(PACKET_VERIFY_DELAY)
+            try:
+                albums = await self.list_albums(bot, group_id)
+            except AlbumError as exc:
+                logger.warning(f"[album] 复核相册「{name}」时读取列表失败：{exc}")
+                continue
+            found = any(album.name == name for album in albums)
+            if found if want else not found:
+                return True
+        return False
 
     async def album_names(self, bot: Any, group_id: str) -> list[str]:
         """列出群里已有相册名，用于报错时提示"""

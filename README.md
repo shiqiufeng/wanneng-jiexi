@@ -284,22 +284,31 @@ SnowLuma HTTP 地址默认为 `http://127.0.0.1:3000`。这里填写的是 **One
 - `删除`：**只有**相册所有者（配置项 `album_owner_ids`，默认 `3556654921`），群主与管理员也不行；
 - 删除走**精确匹配**，所以「/删除相册旅游」不会误删「旅游风景」。
 
-> ⚠️ **建相册 / 删相册依赖协议端暴露对应接口，NapCat 目前没有开放。**
+> ⚠️ **建相册 / 删相册：NapCat 没有开放对应 action，插件会自动改走「原始发包」。**
 > 截至 NapCat 当前 main 分支，`router.ts` 的 action 表里相册相关的只有
 > `get_qun_album_list`、`get_group_album_media_list`、`upload_image_to_qun_album`、
 > `upload_images_to_qun_album`、`upload_video_to_qun_album`、`do_group_album_comment`、
 > `set_group_album_media_like`、`cancel_group_album_media_like`、`del_group_album_media`
-> —— 最后那个删的是相册里的**媒体**，不是相册本身；内核层虽然有 `addAlbum` /
-> `deleteAlbum`，但没有暴露成 action。
+> —— 最后那个删的是相册里的**媒体**，不是相册本身；内核层（`NodeIKernelAlbumService`）
+> 虽然声明了 `addAlbum` / `deleteAlbum`，但没有暴露成 action。
 >
-> 因此这两个命令会**按候选 action 名逐个探测**（`create_qun_album`、
-> `create_group_album`、`add_qun_album`、`add_group_album` / 删除同理）：
-> 哪个名字被协议端认得就用哪个，**建完 / 删完还会重新拉一次相册列表复核**，
-> 接口假装成功不算成功。四个候选全都命中 1404 时，命令会**如实回报**
-> 「协议端没有提供该接口」并给出手动步骤 —— 不会假装建好了。
+> 插件因此按三级回退处理：
 >
-> 也就是说：在你的 NapCat 上，请先到 **群聊 → 群相册 → 新建相册** 里手动建一次
-> （只需一次），之后 `/相册旅游 <链接>` 就能一直把作品传进「旅游」。
+> 1. **候选 action 探测**：`create_qun_album` / `create_group_album` /
+>    `add_qun_album` / `add_group_album`（删除同理），每个名字再按多种参数形状试
+>    （`group_id + name + desc`、`group_id + album_name`、……）。LLOneBot 的
+>    `create_group_album` / `delete_group_album` 就在这里命中；
+> 2. **原始发包**：群相册在内核里走的是 trpc 服务
+>    `QunAlbum.trpc.qzone.webapp_qun_media.QunMedia`（`AddAlbum` / `DeleteAlbum`），
+>    插件用 NapCat 的 `send_packet` 把这条包原样发出去 —— **这条路在 NapCat 上可用，
+>    但要求 NapCat 启用了 `packetBackend`**（见
+>    [NapCat 文档](https://napneko.github.io/config/advanced)；未启用时回执会引用
+>    NapCat 自己的报错并给出文档链接）；
+> 3. 都不行时**如实回报**原因 + 手动步骤（**群聊 → 群相册 → 新建相册**，只需一次）。
+>
+> 无论走哪条路，**建完 / 删完都会重新拉一次相册列表复核**：接口说成功但列表里
+> 没出现（或没消失）就判失败，绝不假装建好了。服务端返回的 `retCode` / `retMsg`
+> 也会被解析出来写进回执，方便区分「权限不足」「相册名重复」。
 
 上传内容与解析结果一一对应：
 
@@ -438,12 +447,23 @@ A：这是 v1.8.4 修掉的 bug。`bot.call_action()` 返回的是响应里的 `
 另外确认协议端是 **NapCat 且版本 ≥ v4.18.30**（群相册是 NapCat 扩展接口）。
 
 **Q：`/创建相册旅游` 回「协议端没有提供『创建群相册』接口」，是插件的问题吗？**
-A：不是。这是 NapCat 的事实：截至当前 main 分支，`router.ts` 的 action 表里
-**没有**建相册 / 删相册的 action（内核里 `NodeIKernelAlbumService` 有 `addAlbum` /
-`deleteAlbum`，但没暴露成 OneBot 接口）。插件只会按候选名逐个探测，全都不认得时
-**如实回报 + 给出手动步骤**，不会假装成功。请到 群聊 → 群相册 → 新建相册 手动建一次
-（只需一次），之后 `/相册旅游 <链接>` 就能持续把作品传进「旅游」相册。
-如果哪天 NapCat 或某个分支补上了这个接口，本命令无需升级即会自动生效。
+A：**v1.8.9 起已不再止步于此。** 事实是 NapCat 截至当前 main 分支的 `router.ts`
+action 表里**没有**建/删相册的 action（内核 `NodeIKernelAlbumService` 里声明了
+`addAlbum` / `deleteAlbum`，但没暴露成 OneBot 接口）。v1.8.9 的插件会在这之后
+**自动改走原始发包**：群相册在内核里走的是 trpc 服务
+`QunAlbum.trpc.qzone.webapp_qun_media.QunMedia.AddAlbum` / `.DeleteAlbum`，插件用
+NapCat 的 `send_packet` 把这条包原样发出去，发完再拉一次相册列表复核。
+**这条路要求 NapCat 启用了 `packetBackend`** —— 若回执里出现
+「`packetBackend` 不可用 + napneko.github.io 链接」，说明该后端被禁用或当前 QQ
+版本/架构不在支持表里，按链接里的说明开启即可；实在不行，到
+**群聊 → 群相册 → 新建相册** 手动建一次（只需一次），之后 `/相册旅游 <链接>` 就能
+持续把作品传进「旅游」相册。若哪天 NapCat 或某个分支补上了对应 action，命令无需
+升级也会自动生效（候选表里已经含 `create_group_album` / `delete_group_album`）。
+
+**Q：`/创建相册旅游` 回「协议端拒绝了建相册请求：xxx」是什么情况？**
+A：这说明原始发包**真的发到了服务端并被拒绝**，回执里的 `xxx` 就是腾讯返回的原因
+（例如权限不足、相册名重复、群号不对）。此时不是插件或协议端版本的问题，按提示
+换个相册名、或换群主/管理员身份的账号再试。
 
 **Q：`/删除相册旅游` 会不会把「旅游风景」也删掉？**
 A：不会。删除走**精确同名**匹配（`find_album_exact`），只有名字完全一致的那一个才会被删。

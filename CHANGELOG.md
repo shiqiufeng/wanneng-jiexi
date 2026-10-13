@@ -1,5 +1,62 @@
 # 更新日志
 
+## v1.8.9
+
+> 建相册 / 删相册**真正能用了**：NapCat 没有把这两个能力暴露成 OneBot action，
+> 本版改为**直接用 NapCat 的 `send_packet` 发内核本来就会发的那条 trpc 包**，
+> 发完仍以「重新拉一次相册列表」为准复核。
+
+### 新增
+
+- **原始发包通路（建相册 / 删相册）**：群相册在内核里走的不是 OIDB，而是 qzone 的
+  trpc 服务
+
+      QunAlbum.trpc.qzone.webapp_qun_media.QunMedia.AddAlbum     建相册
+      QunAlbum.trpc.qzone.webapp_qun_media.QunMedia.DeleteAlbum  删相册
+
+  本版按 QQ NT 内核 AlbumService 的字段定义（与 LLOneBot、SnowLuma 两个独立实现
+  交叉核对过）把请求体用纯 Python 拼成 protobuf，经 NapCat 的 `send_packet`
+  发出去，并解析响应里的 `retCode` / `retMsg` / `albumId` 写进回执。
+  发之前先用 `get_packet_status` 探活；PacketBackend 不可用时**原样引用 NapCat
+  自己的报错**（含 napneko.github.io 文档链接）。
+- **参数形状重试**：候选 action 现在按「名字 × 参数形状」逐个试
+  （`group_id + name + desc`、`group_id + album_name`、`group_id + group_name`……），
+  命中「参数不对」就换形状、命中「没这个 action」就换名字。LLOneBot 的
+  `create_group_album` / `delete_group_album`（需要 `group_id + name + desc` /
+  `group_id + album_id`）由此可直接命中。
+- 新增 `core/album.py` 的离线可测工具：`build_create_album_payload` /
+  `build_delete_album_payload` / `parse_pb` / `parse_album_packet_response` /
+  `hex_response_to_bytes` / `album_session_id` / `album_action_kwargs`。
+
+### 修复
+
+- **`hex` 响应不会被当成整数吞掉**：`send_packet` 回的是十六进制字符串，形如
+  `123456` 的纯数字 hex 用 `json.loads` 会解析成整数、字节直接丢失。新增
+  `hex_response_to_bytes()` 专门处理（也兼容信封形态的响应）。
+- **成败判定不再依赖返回码**：先复核相册列表、再用 `retCode` 解释原因。这样万一
+  响应体形态与预期不同，也不会把**已经建成功的相册**误报成失败。
+- `_explain_exception` 对 `send_packet` / `get_packet_status` 给出更准确的提示
+  （原始发包需要 NapCat + 启用 `packetBackend`），不再一律说「需要 v4.18.30+」。
+- `_album_verified()` 支持重试（`attempts`），发完包等一会儿再查列表，避免
+  「刚建好还没同步」被误判成失败。
+- 抛给用户的原始发包失败原因**截断到 200 字**，避免 NapCat 的错误堆栈刷屏。
+
+### 测试
+
+- `_albumprobe/test_uploader.py` 从 131 项扩到 **170 项**，新增：
+  - 建相册原始发包：`cmd` 是 trpc AddAlbum、`rsp=True`、请求体解出来的群号/相册名正确；
+  - 探活失败 → 不发包、回执带文档链接、超长堆栈被截断；
+  - 返回码非 0 但列表已生效 → **仍判成功**；返回码非 0 且没生效 → 透出 `retMsg`；
+  - 发包成功但列表没出现 → 如实回报「可能还没同步」，不假装成功；
+  - 删相册原始发包：请求体里是**精确同名**那个的 `album_id`；
+  - trpc 命令字、protobuf 组包（requestId / 空 field2,3 / body.info / sessionId 形态 /
+    `fc-appid: 100` header）、响应解析、hex 转换（含 `123456` 纯数字陷阱）；
+  - 参数形状重试（第一形状被拒 → 换第二形状成功）。
+- 回归全绿：`_fixprobe/test_commands.py` **122 项**（新增第 9 组：发包通路落在
+  core/album.py、命令字写死断言、`create_album` 会退到原始发包、**复核排在返回码
+  判断之前**、自检命令报 packetBackend 状态）、`test_mobile_feed.py` 40 项、
+  `test_urlpick.py` 12 项、`test_fallback.py` 8 项。
+
 ## v1.8.8
 
 > 相册命令补齐：**相册名写进命令**，`/相册旅游 <链接>` 直接传进「旅游」；
