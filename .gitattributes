@@ -1,0 +1,21 @@
+# 统一换行符：避免 Windows 下克隆/提交把 shell 脚本写成 CRLF，
+# 导致 Linux 上执行报 `bad interpreter: /usr/bin/env bash^M`
+* text=auto eol=lf
+*.sh text eol=lf
+*.py text eol=lf
+*.yaml text eol=lf
+*.yml text eol=lf
+*.json text eol=lf
+*.md text eol=lf
+
+# 二进制文件不做换行符转换
+*.png binary
+*.jpg binary
+*.jpeg binary
+*.gif binary
+*.webp binary
+*.ico binary
+*.zip binary
+*.ttf binary
+*.woff binary
+*.woff2 binary
