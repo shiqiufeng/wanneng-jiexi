@@ -503,8 +503,10 @@ class ParserPlugin(Star):
         report = UploadReport(album_name=album.name)
 
         # 群相册上传接口没有标题/描述参数（NapCat 把 sPicDesc 固定成空串且没有
-        # 往外暴露），文案只能落到相册评论上：图片整批合并成一条说说，写一次即可；
-        # 视频各自成贴，每个条目各写一次。写没写成功由 write_title 如实返回。
+        # 往外暴露），文案只能落到相册评论上 —— 而电脑版 QQ 看不到相册评论，
+        # 故 v1.9.4 起默认关闭（album_title_comment）：图片整批合并成一条说说，
+        # 写一次即可；视频各自成贴，每个条目各写一次。
+        # 写没写成功由 write_title 如实返回；没开这项就一次都不调。
         title = (parse_res.title or parse_res.text or "").strip()
         want_comment = bool(title) and self.cfg.album_title_comment
 
@@ -558,9 +560,11 @@ class ParserPlugin(Star):
                     report.comment_errors.append(reason)
 
         lines = report.lines()
-        if title:
+        if title and want_comment:
             # 文案有没有真的写进相册要分开说：写成功才说「已写入」，
             # 否则必须让用户知道点开相册看到的是「只有图、没有字」。
+            # 没开这项（默认关闭）就一句都不提 —— 相册里本来就没有文案可看，
+            # 再回一句「未能写入」只会让人以为上传失败了。
             if report.titles:
                 lines.append(f"文案已写入相册评论：{title[:80]}")
             else:
@@ -676,7 +680,7 @@ class ParserPlugin(Star):
         yield event.plain_result(
             f"主页共 {len(works)} 个作品，开始逐个上传到群相册「{album.name}」。\n"
             "每个作品在相册里各自成一条（同一作品的多张图合并成一条说说，"
-            "视频因协议限制各自成贴）；文案写在该条的评论里。\n"
+            "视频因协议限制各自成贴）。\n"
             "媒体需要逐个下载上传，耗时较长，全部完成后再回一条汇总。"
         )
 
@@ -1097,32 +1101,40 @@ class ParserPlugin(Star):
                 )
                 lines.append(f"[{'通过' if ok else '失败'}] {label}：{'可用' if ok else reason}")
 
-            # 评论通路：真实发一次（参数形状填完整、含必填的 lloc），把协议端
-            # 自己的参数校验和上游原生 bug 直接摊给用户，而不是等上传完才发现
-            # 文案一个字都没写进相册。
-            ok, reason = await uploader.comment_probe(bot, gid, album)
-            if ok:
+            # 评论通路默认关闭（电脑版 QQ 看不到相册评论，且 NapCat ≤ v4.18.38
+            # 必定报错）。只有显式打开时才实发一次探测，别让自检凭空多打几次接口。
+            if not self.cfg.album_title_comment:
                 lines.append(
-                    "[通过] 文案写评论：" + (f"可用（{reason}）" if reason else "可用")
+                    "[跳过] 文案写评论：已在配置里关闭（默认关闭；"
+                    "打开后本行会变成真实探测结果）"
                 )
             else:
-                lines.append(f"[失败] 文案写评论：{reason}")
-
-            # 实读一次媒体列表：文案能不能写进去，全看这里能不能解析出
-            # 「本次上传的那条媒体」。原始键名一并打出来 —— lloc 挂在
-            # image.lloc 还是 video.cover.lloc 完全由协议端决定，这是排查
-            # 「图片传上去了、文案一个字都没有」最快的一手证据。
-            try:
-                targets, dump = await uploader.media_dump(bot, gid, album)
-            except AlbumError as e:
-                lines.append(f"[失败] 读取相册媒体列表：{e}")
-            else:
-                lines.extend(dump)
-                if not targets:
+                # 真实发一次（参数形状填完整、含必填的 lloc），把协议端自己的
+                # 参数校验和上游原生 bug 直接摊给用户，而不是等上传完才发现
+                # 文案一个字都没写进相册。
+                ok, reason = await uploader.comment_probe(bot, gid, album)
+                if ok:
                     lines.append(
-                        "  说明：没解析出 lloc（评论接口只认 lloc），文案无法写入，"
-                        "请把上面「媒体列表」几行发给作者"
+                        "[通过] 文案写评论：" + (f"可用（{reason}）" if reason else "可用")
                     )
+                else:
+                    lines.append(f"[失败] 文案写评论：{reason}")
+
+                # 实读一次媒体列表：文案能不能写进去，全看这里能不能解析出
+                # 「本次上传的那条媒体」。原始键名一并打出来 —— lloc 挂在
+                # image.lloc 还是 video.cover.lloc 完全由协议端决定，这是排查
+                # 「图片传上去了、文案一个字都没有」最快的一手证据。
+                try:
+                    targets, dump = await uploader.media_dump(bot, gid, album)
+                except AlbumError as e:
+                    lines.append(f"[失败] 读取相册媒体列表：{e}")
+                else:
+                    lines.extend(dump)
+                    if not targets:
+                        lines.append(
+                            "  说明：没解析出 lloc（评论接口只认 lloc），文案无法写入，"
+                            "请把上面「媒体列表」几行发给作者"
+                        )
 
         # 建/删相册的两条通路：候选 action 是否被认得 + 原始发包后端是否可用。
         # 这两处是「/创建相册 为什么失败」的一手证据。

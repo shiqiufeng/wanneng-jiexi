@@ -121,10 +121,10 @@
         ]
     },
     "album_title_comment": {
-        "description": "把文案写入相册评论",
-        "hint": "群相册上传接口没有标题参数，开启后会把作品文案作为相册评论写上去（需 NapCat 支持发表群相册评论）",
+        "description": "把文案写入相册评论（默认关闭）",
+        "hint": "默认关闭：电脑版 QQ 看不到群相册评论，且 NapCat ≤ v4.18.38 的评论接口必定报错（上游 bug NapNeko/NapCatQQ#1979）。只有升级到含该修复的 NapCat 构建、且你确实想在手机端看到文案时才打开",
         "type": "bool",
-        "default": true
+        "default": false
     },
     "album_max_media": {
         "description": "单次上传上限",

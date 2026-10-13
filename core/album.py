@@ -686,6 +686,18 @@ class Album:
     name: str
 
 
+def _dedup_count(items: list[str]) -> list[tuple[str, int]]:
+    """按出现顺序去重并计数（相同原因只保留第一条，并记下重复次数）"""
+    order: list[str] = []
+    counter: dict[str, int] = {}
+    for item in items:
+        if item not in counter:
+            counter[item] = 0
+            order.append(item)
+        counter[item] += 1
+    return [(item, counter[item]) for item in order]
+
+
 @dataclass(slots=True)
 class UploadReport:
     """一次上传的结果汇总，用于给用户回执"""
@@ -721,10 +733,16 @@ class UploadReport:
         out = [f"已上传到群相册「{self.album_name}」：{head}"]
         if self.entries and self.entries < self.total:
             out.append(f"· 相册里合并为 {self.entries} 条")
+        if self.videos > 1:
+            # 用户看到「视频 4 个」却不知道为什么相册里是 4 条：这是 NapCat 的
+            # 协议限制，视频走独立会话、封面上传不带 batchId，没法并进同一条说说。
+            out.append("· 视频在相册里各成一条（视频接口不带批次号，无法合成一条）")
         if self.titles:
             out.append(f"· 已写入文案：{self.titles} 条")
-        for item in self.comment_errors:
-            out.append(f"· 文案未写入：{item}")
+        # 同一个原因会重复很多次（4 个视频 = 4 次同样的失败），折叠成一条
+        for item, times in _dedup_count(self.comment_errors):
+            suffix = f"（{times} 次）" if times > 1 else ""
+            out.append(f"· 文案未写入{suffix}：{item}")
         for item in self.skipped:
             out.append(f"· 跳过：{item}")
         for item in self.failures:
