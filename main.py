@@ -69,6 +69,15 @@ MODE_PARAM = re.compile(r"^(文件|语音)\s+")
 MAX_LIMIT_PARAM = 200
 """清单条数参数的上限，避免超长翻页"""
 
+HELP_CMD = re.compile(r"^/?(?:解析帮助|解析说明|帮助|parserhelp)$", re.IGNORECASE)
+"""帮助命令，斜杠可省略（如 "/解析帮助"、"解析帮助"）"""
+
+SELFTEST_CMD = re.compile(r"^/?(?:相册自检|相册检测)$")
+"""群相册自检命令，斜杠可省略"""
+
+SHORTLINK_CMD = re.compile(r"^/?(?:短链验证|短链测试)$")
+"""短链自检命令，斜杠可省略"""
+
 
 def parse_params(text: str) -> tuple[str, int | None, str | None]:
     """剥离命令开头的「条数」与「发送方式」参数
@@ -122,6 +131,8 @@ class ParserPlugin(Star):
         await asyncio.to_thread(Renderer.load_resources)
         # 注册解析器
         self._register_parser()
+        # 命令健康自检（只写日志，不改行为）
+        self._log_command_health()
 
     async def terminate(self):
         """插件卸载时触发"""
@@ -180,6 +191,49 @@ class ParserPlugin(Star):
             if isinstance(parser, parser_type):
                 return parser
         raise ValueError(f"未找到类型为 {parser_type} 的 parser 实例")
+
+    def _log_command_health(self) -> None:
+        """启动时把本插件处理函数的注册/启用情况写进日志
+
+        AstrBot 的「指令管理」可以把某条指令停用或改名，被停用的指令会在唤醒
+        阶段被静默跳过（`star_handler.get_handlers_by_event_type` 里
+        `if not handler.enabled: continue`），用户侧的表现就是「命令完全没反应」，
+        日志里也不会有任何报错。这里打一行 INFO/WARNING，方便一眼区分
+        「插件根本没注册上」和「指令被停用了」。
+
+        只读诊断，拿不到注册表就静默跳过，不影响插件运行。
+        """
+        try:
+            from astrbot.core.star.star_handler import star_handlers_registry
+        except Exception as e:  # noqa: BLE001 - 诊断用途，失败即跳过
+            logger.debug(f"[万能解析] 处理函数自检跳过：{e}")
+            return
+
+        mine = [
+            handler
+            for handler in star_handlers_registry
+            if getattr(handler, "handler_module_path", "") == __name__
+        ]
+        if not mine:
+            logger.warning(
+                "[万能解析] AstrBot 注册表里没有本插件的任何处理函数，"
+                "所有命令都不会有响应，请重新加载插件"
+            )
+            return
+
+        disabled = [
+            handler.handler_name
+            for handler in mine
+            if not getattr(handler, "enabled", True)
+        ]
+        if disabled:
+            logger.warning(
+                f"[万能解析] 已注册处理函数 {len(mine)} 个，其中 {len(disabled)} 个"
+                f"在「指令管理」里被停用：{'、'.join(disabled)}。"
+                "被停用的指令不会有任何响应，请到面板的指令管理里重新启用"
+            )
+        else:
+            logger.info(f"[万能解析] 已注册处理函数 {len(mine)} 个，全部启用")
 
     async def _to_audio_only(
         self, parse_res: ParseResult, *, file_name: str | None = None
@@ -378,6 +432,34 @@ class ParserPlugin(Star):
     async def on_message(self, event: AstrMessageEvent):
         """消息的统一入口"""
         umo = event.unified_msg_origin
+
+        # -------- 自带命令入口（不依赖 @filter.command 通道） --------
+        #
+        # AstrBot 的「指令管理」允许把某条指令停用或改名，被停用的指令在唤醒阶段
+        # 会被静默跳过（`if not handler.enabled: continue`），用户侧表现为
+        # 「命令完全没反应，日志也不报错」。on_message 是
+        # EventMessageType.ALL 处理器、不参与指令管理，因此这里用与 /音乐、/全部
+        # 相同的方式兜底出命令；斜杠可有可无（唤醒前缀被剥离后两种写法都落到这里）。
+        cmd = event.message_str.strip()
+        if HELP_CMD.match(cmd):
+            yield event.plain_result(self._help_text())
+            return
+        if SELFTEST_CMD.match(cmd):
+            if not event.is_admin():
+                yield event.plain_result(
+                    f"「/相册自检」仅限管理员使用（当前 ID：{event.get_sender_id()}）"
+                )
+                return
+            yield event.plain_result(await self._album_selftest_lines(event))
+            return
+        if SHORTLINK_CMD.match(cmd):
+            if not event.is_admin():
+                yield event.plain_result(
+                    f"「/短链验证」仅限管理员使用（当前 ID：{event.get_sender_id()}）"
+                )
+                return
+            yield event.plain_result(await self._shortlink_lines())
+            return
 
         # 白名单
         if self.cfg.whitelist and umo not in self.cfg.whitelist:
@@ -626,14 +708,22 @@ class ParserPlugin(Star):
     @filter.command("相册自检", alias={"相册检测"})
     async def album_selftest(self, event: AstrMessageEvent):
         """检查群相册上传是否就绪：列出群内相册，并探测各接口是否可用"""
+        # 实际输出由 on_message 统一完成，此函数仅用于注册命令
+        pass
+
+    async def _album_selftest_lines(self, event: AstrMessageEvent) -> str:
+        """「/相册自检」的正文
+
+        走 on_message 通道执行：AstrBot 的指令管理可以把 @filter.command 注册的
+        指令停用/改名，被停用的指令在唤醒阶段被静默跳过（零回复）；on_message
+        不参与指令管理，因此把命令正文放在这里才能保证一定可达。
+        """
         if not isinstance(event, AiocqhttpMessageEvent):
-            yield event.plain_result("相册自检仅支持 QQ（NapCat）协议端")
-            return
+            return "相册自检仅支持 QQ（NapCat）协议端"
 
         group_id = event.get_group_id()
         if not group_id:
-            yield event.plain_result("请在群聊里使用「/相册自检」")
-            return
+            return "请在群聊里使用「/相册自检」"
 
         bot = event.bot
         gid = str(group_id)
@@ -650,8 +740,7 @@ class ParserPlugin(Star):
             album = await uploader.find_album(bot, gid)
         except AlbumError as e:
             lines.append(f"[失败] 读取群相册：{e}")
-            yield event.plain_result("\n".join(lines))
-            return
+            return "\n".join(lines)
 
         lines.append(f"[通过] 群内相册：{'、'.join(names) if names else '（空）'}")
         if album is not None:
@@ -691,7 +780,7 @@ class ParserPlugin(Star):
             )
             lines.append(f"[{'通过' if ok else '失败'}] 文案写评论：{'可用' if ok else reason}")
 
-        yield event.plain_result("\n".join(lines))
+        return "\n".join(lines)
 
     def _enabled_platform_names(self) -> list[str]:
         """收集已启用平台的显示名称（按注册顺序去重）"""
@@ -704,23 +793,30 @@ class ParserPlugin(Star):
             names.append(parser.platform.display_name)
         return names
 
-    @filter.command("解析帮助", alias={"解析说明", "parserhelp"})
+    @filter.command("解析帮助", alias={"解析说明", "帮助", "parserhelp"})
     async def parser_help(self, event: AstrMessageEvent):
         """查看万能解析的使用帮助"""
-        yield event.plain_result(
-            build_help(self._enabled_platform_names(), self.cfg.album_name)
-        )
+        # 实际输出由 on_message 统一完成，此函数仅用于注册命令
+        pass
+
+    def _help_text(self) -> str:
+        """「/解析帮助」的正文"""
+        return build_help(self._enabled_platform_names(), self.cfg.album_name)
 
     @filter.permission_type(filter.PermissionType.ADMIN)
     @filter.command("短链验证", alias={"短链测试"})
     async def verify_shortlink(self, event: AstrMessageEvent):
         """自检短链服务是否可用：配置、创建短链、短链跳转（经代理/不走代理）"""
+        # 实际输出由 on_message 统一完成，此函数仅用于注册命令
+        pass
+
+    async def _shortlink_lines(self) -> str:
+        """「/短链验证」的正文"""
         shortener = ShortLinkClient(self.cfg, self.downloader.client)
         results = await shortener.verify()
-        lines = [
+        return "\n".join(
             f"[{'通过' if ok else '失败'}] {name}：{detail}" for name, ok, detail in results
-        ]
-        yield event.plain_result("\n".join(lines))
+        )
 
     @filter.permission_type(filter.PermissionType.ADMIN)
     @filter.command("登录B站", alias={"blogin", "登录b站"})
