@@ -82,9 +82,14 @@ _✨ 发个链接，剩下的交给它 ✨_
 
 ### 方式一：面板「从文件安装」（推荐）
 
-1. 下载 `万能解析.zip`（可在本仓库的 **Releases** 页面获取，或本地执行 `python tools/package.py` 生成）；
+1. 下载插件压缩包：
+   - 直接下载：**https://github.com/shiqiufeng/wanneng-jiexi/releases/latest/download/wanneng-jiexi.zip**
+   - 或在本地仓库执行 `python tools/package.py` 生成 `dist/万能解析.zip`
 2. 打开 AstrBot 面板 → **插件** → 右上角安装按钮 → 选 **从文件安装** → **选择文件** → 选中该 zip；
-3. 点击 **安装**，等待依赖装完，插件会自动出现在列表中并处于启用状态。
+3. 点击 **安装**，等待依赖安装完成，插件会自动出现在列表中并处于启用状态。
+
+> 两个文件名内容完全一致，安装结果没有区别，都可以直接用。zip 叫什么名字不影响识别，
+> AstrBot 只读包内的 `metadata.yaml`。
 
 ### 方式二：解压到插件目录
 
@@ -97,13 +102,16 @@ _✨ 发个链接，剩下的交给它 ✨_
 ### 自行打包
 
 ```bash
-python tools/package.py          # 生成 dist/万能解析.zip
+python tools/package.py          # 生成 dist/万能解析.zip 与 dist/wanneng-jiexi.zip
 python tools/verify_archive.py   # 按 AstrBot 的安装校验逻辑自检压缩包
 ```
 
 `tools/verify_archive.py` 复刻了 AstrBot 安装流程中的真实校验（根目录推断、metadata 定位、
 `name/desc/version/author` 必需字段、安装目录名是否为合法 Python 标识符），
 可在上传前提前发现「压缩包不是合法的 AstrBot 插件」这类问题。
+
+> 为什么要两份：GitHub Release 的附件名**不接受中文**（上传会返回 422），
+> 所以发 Release 时用 ASCII 名的 `wanneng-jiexi.zip`；本地安装用哪个都行。
 
 ### 依赖
 

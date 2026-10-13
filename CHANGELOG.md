@@ -15,7 +15,8 @@
 
 - 新增 **`/解析帮助`** 命令（别名 `解析说明`、`parserhelp`），输出当前已启用的平台列表、
   全部命令、可选参数用法与实况图说明；帮助文案集中在 `core/help.py` 维护。
-- 新增打包脚本 `tools/package.py`，一键生成 `dist/万能解析.zip`。
+- 新增打包脚本 `tools/package.py`，一键生成 `dist/万能解析.zip`，并同时输出 ASCII 名副本
+  `dist/wanneng-jiexi.zip`（GitHub Release 附件名不接受中文，上传会返回 422）。
 - 新增 `tools/verify_archive.py`，按 AstrBot 安装流程的校验逻辑（根目录推断、metadata 定位、
   必需字段、目录名合法性）预先校验压缩包，避免面板上传时报「压缩包不是合法的 AstrBot 插件」。
 - `metadata.yaml` 补充 `short_desc`（插件市场卡片短描述）与 `repo`（仓库地址）字段。
