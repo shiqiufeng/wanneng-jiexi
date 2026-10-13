@@ -28,10 +28,35 @@ aiocqhttp 的 ``bot.call_action()`` **已经把 OneBot 信封剥掉**，只返�
 
 现在统一走 :meth:`GroupAlbumUploader._payload` 归一化：信封、data 本体、
 JSON 字符串、纯数组四种形态都能吃下。
+
+⚠️ 「成功但没 data」的坑
+------------------------
+上传类 action 在 NapCat 里**成功时不返回任何数据**：
+
+* ``uploadImagesToQunAlbum`` 循环传完直接 return（源码里没有 return 值）；
+* ``uploadImageToQunAlbum`` 只是前者包了一层单元素数组；
+* ``uploadVideoToQunAlbum`` 最后也没有 return。
+
+OneBot 信封里 ``data: undefined`` 序列化后直接消失，aiocqhttp 于是回吐
+``None``。早期实现把 ``None`` 一律判成失败 —— 于是**明明上传成功，
+回执却是「失败：图片 xxx.jpeg：协议端返回未知错误」**，并且因为判定失败
+又退化成逐张上传，把本该合并成一条的图集在相册里刷成一条一条。
+
+现在 :meth:`GroupAlbumUploader._ok` 带 ``void_ok`` 参数，上传/评论这类
+「成功即无返回体」的 action 一律按 void 语义判定：**没抛异常就是成功**。
+
+⚠️ 为什么一定要走「一次性多图」
+-------------------------------
+``uploadImagesToQunAlbum`` 内部给同批图片**共用一个 batchId**，并按
+「第几张 / 共几张」（batchIndex / photo_num / batch_num）上报，QQ 相册
+才会把它们合并显示成**同一条说说**。逐张调用 ``upload_image_to_qun_album``
+时每张都有自己的 batchId，相册里就是一条一张。因此上传路径必须
+「先整批、后逐张」，而不是反过来。
 """
 
 from __future__ import annotations
 
+import asyncio
 import base64
 import json
 from dataclasses import dataclass, field
@@ -44,12 +69,39 @@ from astrbot.api import logger
 # 请求体撑爆，且 NapCat 侧要整段读进内存）
 BASE64_MAX_MB = 24
 
+#: 上传最多尝试几次。NapCat 的分片上传会偶发
+#: 「分片 N 上传失败: 服务器开小差了,请稍后重试(-114)」，属于可重试的瞬时错误
+UPLOAD_ATTEMPTS = 3
+
+#: 重试间隔（秒），给服务端一点喘息时间
+UPLOAD_RETRY_DELAY = 2.5
+
+#: 判定「这个失败值得重试」的线索
+_TRANSIENT_HINTS = (
+    "开小差",
+    "-114",
+    "timeout",
+    "timed out",
+    "超时",
+    "busy",
+    "繁忙",
+    "稍后重试",
+    "connection",
+    "network",
+)
+
 # album_list 里可能出现的字段别名，NapCat 不同版本命名不完全一致
 _ID_KEYS = ("album_id", "id", "albumId", "albumid")
 _NAME_KEYS = ("album_name", "name", "title", "albumName")
 
-# media_list 里媒体 ID 的字段别名
+# media_list 里媒体 ID 的字段别名（顶层）
 _MEDIA_ID_KEYS = ("lloc", "media_id", "mediaId", "id", "pic_key")
+
+#: 深搜时用的 ID 别名：去掉过于泛化的 ``id``，避免命中无关字段
+_MEDIA_ID_DEEP_KEYS = ("lloc", "media_id", "mediaId", "pic_key")
+
+#: 上传批次 ID 的别名。批内多图共用，用来评论「一整条说说」
+_BATCH_KEYS = ("batch_id", "batchId", "batchid")
 
 #: get_qun_album_list 的 data 形态：{album_list: [...], attach_info, has_more}
 #: NapCat 一定用 album_list，其余键名是给别的协议端留的余地
@@ -91,8 +143,10 @@ class UploadReport:
     """成功上传的图片张数"""
     videos: int = 0
     """成功上传的视频个数"""
+    entries: int = 0
+    """相册里新增的「说说」条数。多图一次性上传会把同批合并成 1 条"""
     titles: int = 0
-    """成功写入文案的媒体数（评论形式）"""
+    """成功写入文案的条数（评论形式）"""
     skipped: list[str] = field(default_factory=list)
     """跳过的项及原因"""
     failures: list[str] = field(default_factory=list)
@@ -111,8 +165,10 @@ class UploadReport:
             parts.append(f"视频 {self.videos} 个")
         head = "、".join(parts) if parts else "0 项"
         out = [f"已上传到群相册「{self.album_name}」：{head}"]
+        if self.entries and self.entries < self.total:
+            out.append(f"· 相册里合并为 {self.entries} 条")
         if self.titles:
-            out.append(f"已为 {self.titles} 项写入文案")
+            out.append(f"· 已写入文案：{self.titles} 条")
         for item in self.skipped:
             out.append(f"· 跳过：{item}")
         for item in self.failures:
@@ -207,10 +263,25 @@ class GroupAlbumUploader:
         raise AlbumError(f"当前协议端不支持 {action}（群相册需要 NapCat）")
 
     @staticmethod
-    def _ok(resp: Any) -> bool:
-        """判断 OneBot 响应是否为成功"""
+    def _ok(resp: Any, *, void_ok: bool = False) -> bool:
+        """判断 OneBot 响应是否为成功
+
+        Args:
+            resp: ``call_action`` 的返回值
+            void_ok: 该 action 成功时**本来就不返回 data** 时为 True。
+                NapCat 的 ``upload_images_to_qun_album`` /
+                ``upload_image_to_qun_album`` / ``upload_video_to_qun_album``
+                都是这种「void」action：循环传完直接 return，响应体里没有
+                ``data`` 字段，aiocqhttp 于是回吐 ``None``。失败时 NapCat 会
+                throw，aiocqhttp 抛 ``ActionFailed``（走的是异常分支），
+                所以这里**没抛异常就说明成功**。
+
+                早期实现把 ``None`` 一律判成失败，结果上传成功的图被回执成
+                「协议端返回未知错误」，还因为判定失败又逐张重传，把本该
+                合并成一条的图集在相册里刷成一条一条。
+        """
         if resp is None:
-            return False
+            return void_ok
         if not isinstance(resp, dict):
             return True
         status = str(resp.get("status") or "").lower()
@@ -222,6 +293,33 @@ class GroupAlbumUploader:
             return False
         # 1404 = action not found（NapCat 版本过旧）
         return retcode == 0
+
+    @staticmethod
+    def _is_missing_action(resp_or_reason: Any) -> bool:
+        """判断失败原因是不是「协议端根本没有这个 action」
+
+        这类失败不该重试，只能退化成别的接口。
+        """
+        text = (
+            resp_or_reason
+            if isinstance(resp_or_reason, str)
+            else GroupAlbumUploader._fail_reason(resp_or_reason)
+        )
+        lowered = text.lower()
+        return "不支持" in text or any(
+            hint in lowered for hint in _MISSING_ACTION_HINTS
+        )
+
+    @staticmethod
+    def _is_transient(resp_or_reason: Any) -> bool:
+        """判断失败原因是不是值得重试的瞬时错误（分片 -114 / 超时 / 网络）"""
+        text = (
+            resp_or_reason
+            if isinstance(resp_or_reason, str)
+            else GroupAlbumUploader._fail_reason(resp_or_reason)
+        )
+        lowered = text.lower()
+        return any(hint in lowered for hint in _TRANSIENT_HINTS)
 
     @staticmethod
     def _fail_reason(resp: Any) -> str:
@@ -244,6 +342,17 @@ class GroupAlbumUploader:
             if retcode:
                 return f"retcode={retcode}"
         return "协议端返回未知错误"
+
+    async def _call_quiet(self, bot: Any, action: str, **payload: Any) -> Any:
+        """调用扩展 action，把异常统一包装成必定判失败的响应体
+
+        与 :meth:`_call` 的区别是不抛异常，便于上传路径按「候选 → 重试 →
+        降级」串起来。
+        """
+        try:
+            return await self._call(bot, action, **payload)
+        except AlbumError as exc:
+            return _error_response(str(exc))
 
     # ---------------- 相册定位 ----------------
 
@@ -422,6 +531,37 @@ class GroupAlbumUploader:
 
     # ---------------- 上传 ----------------
 
+    @staticmethod
+    def _deep_get(node: Any, keys: tuple[str, ...], *, max_depth: int = 6) -> str:
+        """在嵌套结构里深度优先找第一个非空字段
+
+        NapCat 的 ``media_list`` 元素是 QQ 原生的 feed 结构，``lloc`` /
+        ``batch_id`` 埋得比较深（形如 ``cell_media.batch_id``、
+        ``cell_media.media_items[].image.lloc``），顶层直接取会一无所获，
+        表现就是「上传成功了但文案没写进去」。这里做一次受限深搜。
+        """
+        stack: list[tuple[Any, int]] = [(node, 0)]
+        while stack:
+            current, depth = stack.pop(0)
+            if depth > max_depth:
+                continue
+            if isinstance(current, dict):
+                for key in keys:
+                    value = current.get(key)
+                    if value is None:
+                        continue
+                    text = str(value).strip()
+                    if text:
+                        return text
+                for value in current.values():
+                    if isinstance(value, (dict, list)):
+                        stack.append((value, depth + 1))
+            elif isinstance(current, list):
+                for value in current:
+                    if isinstance(value, (dict, list)):
+                        stack.append((value, depth + 1))
+        return ""
+
     def _file_candidates(self, path: Path) -> list[str]:
         """file 参数候选：优先本地路径，必要时退化为 base64"""
         candidates = [str(path)]
@@ -441,6 +581,32 @@ class GroupAlbumUploader:
         candidates.append("base64://" + base64.b64encode(raw).decode("ascii"))
         return candidates
 
+    async def _attempt_upload(
+        self, bot: Any, action: str, payload: dict[str, Any], label: str
+    ) -> Any:
+        """调用一次上传 action，瞬时错误时按固定间隔重试
+
+        上传类 action 成功时没有返回体（见模块顶部「成功但没 data」一节），
+        因此判定一律带 ``void_ok=True``，即**没抛异常就是成功**。
+        """
+        last: Any = None
+        for attempt in range(UPLOAD_ATTEMPTS):
+            resp = await self._call_quiet(bot, action, **payload)
+            if self._ok(resp, void_ok=True):
+                if attempt:
+                    logger.info(f"[album] {label} 第 {attempt + 1} 次尝试上传成功")
+                return resp
+            last = resp
+            if self._is_missing_action(resp) or not self._is_transient(resp):
+                break
+            if attempt + 1 < UPLOAD_ATTEMPTS:
+                logger.info(
+                    f"[album] {label} 上传遇到瞬时错误（{self._fail_reason(resp)}），"
+                    f"{UPLOAD_RETRY_DELAY:.1f}s 后重试"
+                )
+                await asyncio.sleep(UPLOAD_RETRY_DELAY)
+        return last
+
     async def _upload_one(
         self,
         bot: Any,
@@ -451,7 +617,11 @@ class GroupAlbumUploader:
         *,
         key: str = "file",
     ) -> Any:
-        """按候选顺序尝试上传单个文件，返回最后一次响应"""
+        """按候选顺序尝试上传单个文件，返回最后一次响应
+
+        候选顺序是「本地路径 → base64」，同一候选遇到瞬时错误时由
+        :meth:`_attempt_upload` 负责重试。
+        """
         payload = {
             "group_id": str(group_id),
             "album_id": album.album_id,
@@ -459,18 +629,16 @@ class GroupAlbumUploader:
         }
         last: Any = None
         for index, value in enumerate(self._file_candidates(path)):
-            try:
-                resp = await self._call(bot, action, **{key: value}, **payload)
-            except AlbumError as exc:
-                last = _error_response(str(exc))
-                continue
-            if self._ok(resp):
+            resp = await self._attempt_upload(
+                bot, action, {key: value, **payload}, path.name
+            )
+            if self._ok(resp, void_ok=True):
                 if index:
                     logger.info(f"[album] {path.name} 经 base64 兜底上传成功")
                 return resp
             last = resp
             # 接口不存在就没必要再换 file 形式重试
-            if "不支持" in self._fail_reason(resp):
+            if self._is_missing_action(resp):
                 break
         return last
 
@@ -482,7 +650,16 @@ class GroupAlbumUploader:
         paths: list[Path],
         report: UploadReport,
     ) -> None:
-        """上传图片：先试一次性多图，不行再逐张"""
+        """上传图片：**优先整批**，同批图片在相册里合并成一条说说
+
+        ``upload_images_to_qun_album`` 内部给同批图片共用一个 batchId，并按
+        「第几张 / 共几张」上报（NapCat 源码注释：「相册里才会合并成同一条」），
+        所以只有整批调用才能得到「一条说说装齐所有图」的效果；逐张调用时每张
+        都有各自的 batchId，相册里就变成一条一张。
+
+        只有「协议端没有这个 action」或整批重试后仍失败时才降级为逐张 ——
+        降级属于保底形态。
+        """
         if not paths:
             return
 
@@ -491,29 +668,36 @@ class GroupAlbumUploader:
             "album_id": album.album_id,
             "album_name": album.name,
         }
+
         if len(paths) > 1:
-            try:
-                resp = await self._call(
-                    bot,
-                    "upload_images_to_qun_album",
-                    files=[str(p) for p in paths],
-                    **payload,
-                )
-            except AlbumError as exc:
-                resp = _error_response(str(exc))
-            if self._ok(resp):
-                report.images += len(paths)
-                return
-            logger.info(
-                f"[album] 多图一次性上传不可用（{self._fail_reason(resp)}），改逐张上传"
+            resp = await self._attempt_upload(
+                bot,
+                "upload_images_to_qun_album",
+                {"files": [str(p) for p in paths], **payload},
+                f"{len(paths)} 张图片",
             )
+            if self._ok(resp, void_ok=True):
+                report.images += len(paths)
+                report.entries += 1
+                return
+            reason = self._fail_reason(resp)
+            if self._is_missing_action(resp):
+                logger.info(
+                    f"[album] 协议端不支持多图一次性上传（{reason}），改逐张上传"
+                )
+            else:
+                logger.warning(
+                    f"[album] 多图一次性上传失败（{reason}），改逐张上传；"
+                    "整批里先传完的图可能已入库，相册里会多出零散条目"
+                )
 
         for path in paths:
             resp = await self._upload_one(
                 bot, "upload_image_to_qun_album", group_id, album, path
             )
-            if self._ok(resp):
+            if self._ok(resp, void_ok=True):
                 report.images += 1
+                report.entries += 1
             else:
                 report.failures.append(f"图片 {path.name}：{self._fail_reason(resp)}")
 
@@ -526,14 +710,23 @@ class GroupAlbumUploader:
         report: UploadReport,
         *,
         cover: Path | None = None,
-    ) -> None:
-        """上传视频；接口不支持时退化为上传封面图"""
+    ) -> bool:
+        """上传视频；接口不支持时退化为上传封面图
+
+        视频走的是另一条链路（建视频会话 → 分片上传拿 sVid → 单独上传封面
+        并带上 vid 挂进相册），封面那一步**不带 batchId**，因此 NapCat 无法
+        把视频并进图片那条说说里，视频必然自成一贴。
+
+        Returns:
+            bool: 是否成功进入相册（真视频或封面图任一成功即 True）
+        """
         resp = await self._upload_one(
             bot, "upload_video_to_qun_album", group_id, album, path
         )
-        if self._ok(resp):
+        if self._ok(resp, void_ok=True):
             report.videos += 1
-            return
+            report.entries += 1
+            return True
 
         reason = self._fail_reason(resp)
         if cover is not None and cover.exists():
@@ -541,23 +734,26 @@ class GroupAlbumUploader:
             cover_resp = await self._upload_one(
                 bot, "upload_image_to_qun_album", group_id, album, cover
             )
-            if self._ok(cover_resp):
+            if self._ok(cover_resp, void_ok=True):
                 report.images += 1
+                report.entries += 1
                 report.skipped.append(f"视频 {path.name} 存成了封面图（{reason}）")
-                return
+                return True
             report.failures.append(
                 f"视频 {path.name}：{reason}；封面兜底也失败（{self._fail_reason(cover_resp)}）"
             )
-            return
+            return False
         report.failures.append(f"视频 {path.name}：{reason}")
+        return False
 
     async def write_title(
         self, bot: Any, group_id: str, album: Album, text: str
     ) -> bool:
-        """把作品文案写成相册里最新一条媒体的评论
+        """把作品文案写成相册里**最新那条说说**的评论
 
-        群相册上传接口本身没有标题/描述参数，评论是 NapCat 能提供的
-        最接近的落点。任何一步拿不到就放弃，不影响上传结果。
+        群相册上传接口本身没有标题/描述参数，评论是 NapCat 能提供的最接近的
+        落点。整批图片会被合并成一条说说，因此一次调用就够覆盖整批；视频各自
+        成贴，需要每个条目调一次。任何一步拿不到就放弃，不影响上传结果。
         """
         text = (text or "").strip()
         if not text:
@@ -593,13 +789,14 @@ class GroupAlbumUploader:
             return False
 
         latest = media_list[0]
-        if not isinstance(latest, dict):
-            return False
 
-        # lloc 定位单张图；拿不到时退回 batch_id 评论整个上传批次
-        lloc = _first(latest, _MEDIA_ID_KEYS)
+        # lloc 定位单张图；batch_id 定位整条说说（同批多图共用一个 batch_id）。
+        # 两者都可能埋在 QQ 原生 feed 结构里，顶层取不到就深搜一次。
+        lloc = _first(latest, _MEDIA_ID_KEYS) if isinstance(latest, dict) else ""
+        if not lloc:
+            lloc = self._deep_get(latest, _MEDIA_ID_DEEP_KEYS)
         if not batch_id:
-            batch_id = _first(latest, ("batch_id", "batchId"))
+            batch_id = self._deep_get(latest, _BATCH_KEYS)
         if not lloc and not batch_id:
             return False
 
@@ -608,13 +805,16 @@ class GroupAlbumUploader:
             "album_id": album.album_id,
             "content": text,
         }
-        if lloc:
-            payload["lloc"] = lloc
+        # batch_id 指向整条说说，更贴合「把文案挂到这一批媒体上」的语义，
+        # 能拿到就优先用它；否则退回单张 lloc。
         if batch_id:
             payload["batch_id"] = batch_id
+        elif lloc:
+            payload["lloc"] = lloc
 
         try:
             resp2 = await self._call(bot, "do_group_album_comment", **payload)
         except AlbumError:
             return False
-        return self._ok(resp2)
+        # 评论接口同样可能「成功但无返回体」，按 void 语义判定
+        return self._ok(resp2, void_ok=True)

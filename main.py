@@ -332,6 +332,10 @@ class ParserPlugin(Star):
 
         抖音实况：静态图按图片上传，实况 mp4 按视频上传；NapCat 版本过旧
         没有视频接口时自动退化为上传视频封面。整个过程不往会话里发媒体。
+
+        图片走 NapCat 的「一次传多张」，同批共用 batchId，相册里**合并成
+        一条说说**（也就是用户要的「一条装齐所有图／视频 + 文案」）；视频走
+        独立的视频链路，NapCat 不支持把视频并进图片批次里，因此视频各自成贴。
         """
         if not isinstance(event, AiocqhttpMessageEvent):
             yield event.plain_result("群相册上传仅支持 QQ（NapCat）协议端")
@@ -380,8 +384,14 @@ class ParserPlugin(Star):
         images, videos = self._collect_album_media(parse_res)
         capacity = uploader.max_media
         report = UploadReport(album_name=album.name)
+        gid = str(group_id)
 
-        # 图片：先全部下载再一次性上传（同一批在相册里显示为同一条）
+        # 群相册上传接口没有标题参数，文案落到相册评论上：图片整批合并成一条
+        # 说说，写一次即可；视频各自成贴，每个条目各写一次。
+        title = (parse_res.title or parse_res.text or "").strip()
+        want_comment = bool(title) and self.cfg.album_title_comment
+
+        # 图片：先全部下载再一次性上传（同批在相册里合并为同一条说说）
         image_paths: list[Path] = []
         for cont in images[:capacity]:
             try:
@@ -394,7 +404,11 @@ class ParserPlugin(Star):
             )
 
         if image_paths:
-            await uploader.upload_images(bot, str(group_id), album, image_paths, report)
+            await uploader.upload_images(bot, gid, album, image_paths, report)
+            if want_comment and report.images and await uploader.write_title(
+                bot, gid, album, title
+            ):
+                report.titles += 1
 
         # 视频体积大，逐个下载逐个传，避免一次性占满内存
         remain = max(0, capacity - len(image_paths))
@@ -413,15 +427,12 @@ class ParserPlugin(Star):
                     cover = await cont.get_cover_path()
                 except Exception:  # noqa: BLE001 - 封面只是兜底，拿不到就算了
                     cover = None
-            await uploader.upload_video(
-                bot, str(group_id), album, path, report, cover=cover
-            )
-
-        # 群相册上传接口没有标题参数，文案落到相册评论上
-        title = (parse_res.title or parse_res.text or "").strip()
-        if title and report.total and self.cfg.album_title_comment:
-            if await uploader.write_title(bot, str(group_id), album, title):
-                report.titles = report.total
+            if not await uploader.upload_video(
+                bot, gid, album, path, report, cover=cover
+            ):
+                continue
+            if want_comment and await uploader.write_title(bot, gid, album, title):
+                report.titles += 1
 
         lines = report.lines()
         if title:
