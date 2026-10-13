@@ -162,24 +162,33 @@ class DouyinParser(BaseParser):
         contents: list[MediaContent] = []
         if mobile.is_image_post(aweme):
             static_urls = mobile.image_urls(aweme)
+            image_fallbacks = mobile.image_fallbacks(aweme)
             for index, image in enumerate(mobile.images(aweme)):
-                if live := mobile.live_url(image):
+                if live_urls := mobile.live_urls(image):
                     contents.extend(
-                        self.create_dynamic_contents([live], headers=self.media_headers)
-                    )
-                elif index < len(static_urls) and static_urls[index]:
-                    contents.extend(
-                        self.create_image_contents(
-                            [static_urls[index]], headers=self.media_headers
+                        self.create_dynamic_contents(
+                            [live_urls[0]],
+                            headers=self.media_headers,
+                            fallbacks={live_urls[0]: live_urls[1:]},
                         )
                     )
-        elif url := mobile.video_url(aweme):
+                elif index < len(static_urls) and static_urls[index]:
+                    url = static_urls[index]
+                    contents.extend(
+                        self.create_image_contents(
+                            [url],
+                            headers=self.media_headers,
+                            fallbacks={url: image_fallbacks.get(url, [])},
+                        )
+                    )
+        elif video_urls := mobile.video_urls(aweme):
             contents.append(
                 self.create_video_content(
-                    url,
+                    video_urls[0],
                     mobile.cover_url(aweme),
                     mobile.duration(aweme),
                     headers=self.media_headers,
+                    fallback_urls=video_urls[1:],
                 )
             )
 
@@ -336,7 +345,10 @@ class DouyinParser(BaseParser):
             )
             contents.extend(
                 self._create_media_contents(
-                    image_urls, live_map, headers=self.media_headers
+                    image_urls,
+                    live_map,
+                    headers=self.media_headers,
+                    image_fallbacks=video_data.image_fallbacks,
                 )
             )
 
@@ -467,13 +479,15 @@ class DouyinParser(BaseParser):
             return None
         return slides_info.aweme_details[0]
 
-    async def _fetch_live_map(self, video_id: str) -> dict[int, str]:
-        """补充查询实况(动态)直链，返回 {图片下标: 实况 mp4 直链}
+    async def _fetch_live_map(self, video_id: str) -> dict[int, list[str]]:
+        """补充查询实况(动态)直链，返回 {图片下标: [实况 mp4 候选直链...]}
 
         分享页 HTML 和 slidesinfo 接口里的 images[].video 恒为 null，
         实况直链只在带 a_bogus 签名的 web 详情接口里返回，因此查
         aweme/detail 接口取 images[].video.play_addr。下标与分享页的
         images 顺序一致（已实测比对），可用于剔除同一张图的静态图。
+
+        每项返回整组候选直链（首选在前），个别 CDN 节点 403 时可自动回退。
         """
         try:
             detail = await self._fetch_aweme_detail(video_id)
@@ -487,34 +501,48 @@ class DouyinParser(BaseParser):
             logger.warning("[抖音] 实况直链获取失败：详情接口未返回作品数据")
             return {}
 
-        live_map: dict[int, str] = {}
+        live_map: dict[int, list[str]] = {}
         for index, image in enumerate(detail.get("images") or []):
             if not isinstance(image, dict):
                 continue
             video = image.get("video")
-            if isinstance(video, dict) and (url := self._pick_url_list(video, "play_addr")):
-                live_map[index] = url
+            if isinstance(video, dict) and (urls := self._pick_url_lists(video, "play_addr")):
+                live_map[index] = urls
         return live_map
 
     def _create_media_contents(
         self,
         image_urls: list[str],
-        live_map: dict[int, str],
+        live_map: dict[int, list[str]],
         headers: dict[str, str],
+        image_fallbacks: dict[str, list[str]] | None = None,
     ) -> list[MediaContent]:
-        """按图生成内容：有实况的图只发实况，其余发静态图"""
+        """按图生成内容：有实况的图只发实况，其余发静态图
+
+        Args:
+            image_urls: 静态图首选直链
+            live_map: {图片下标: [实况候选直链...]}
+            image_fallbacks: {静态图首选直链: [备用直链...]}
+        """
         contents: list[MediaContent] = []
         count = max(len(image_urls), max(live_map, default=-1) + 1)
         for index in range(count):
-            if live_url := live_map.get(index):
+            if live_urls := live_map.get(index):
                 contents.extend(
                     self.create_dynamic_contents(
-                        [live_url], headers=self.media_headers
+                        [live_urls[0]],
+                        headers=self.media_headers,
+                        fallbacks={live_urls[0]: live_urls[1:]},
                     )
                 )
-            elif index < len(image_urls):
+            elif index < len(image_urls) and image_urls[index]:
+                url = image_urls[index]
                 contents.extend(
-                    self.create_image_contents([image_urls[index]], headers=headers)
+                    self.create_image_contents(
+                        [url],
+                        headers=headers,
+                        fallbacks={url: (image_fallbacks or {}).get(url, [])},
+                    )
                 )
         return contents
 
@@ -541,7 +569,10 @@ class DouyinParser(BaseParser):
             )
             contents.extend(
                 self._create_media_contents(
-                    image_urls, live_map, headers=self.media_headers
+                    image_urls,
+                    live_map,
+                    headers=self.media_headers,
+                    image_fallbacks=slides_data.image_fallbacks,
                 )
             )
 
@@ -647,6 +678,14 @@ class DouyinParser(BaseParser):
         if isinstance(child, dict) and (urls := child.get("url_list")):
             return urls[0]
         return None
+
+    @staticmethod
+    def _pick_url_lists(node: dict, key: str) -> list[str]:
+        """从 node[key].url_list 里取出全部候选地址（按可用性排序）"""
+        child = node.get(key)
+        if isinstance(child, dict) and (urls := child.get("url_list")):
+            return mobile.order(urls)
+        return []
 
     async def _request_web_api(
         self, endpoint: str, params: dict[str, str], referer: str
@@ -770,17 +809,19 @@ class DouyinParser(BaseParser):
 
     @staticmethod
     def _pick_cover(item: dict) -> str | None:
-        """取作品封面：视频取 video.cover，图集取首图"""
+        """取作品封面：视频取 video.cover，图集取首图（按可用性排序取首选）"""
         video = item.get("video")
         if isinstance(video, dict):
             for key in ("cover", "origin_cover", "dynamic_cover"):
                 node = video.get(key)
-                if isinstance(node, dict) and (urls := node.get("url_list")):
+                if isinstance(node, dict) and (urls := mobile.order(node.get("url_list") or [])):
                     return urls[0]
         images = item.get("images")
         if isinstance(images, list):
             for image in images:
-                if isinstance(image, dict) and (urls := image.get("url_list")):
+                if isinstance(image, dict) and (
+                    urls := mobile.order(image.get("url_list") or [])
+                ):
                     return urls[0]
         return None
 
@@ -854,7 +895,12 @@ class DouyinParser(BaseParser):
         if isinstance(images, list) and images:
             first = images[0]
             if isinstance(first, dict) and (urls := first.get("url_list")):
-                contents = self.create_image_contents([urls[0]], headers=self.media_headers)
+                cands = mobile.order(urls)
+                contents = self.create_image_contents(
+                    [cands[0]],
+                    headers=self.media_headers,
+                    fallbacks={cands[0]: cands[1:]},
+                )
 
         if not contents and (cover := self._pick_cover(item)):
             cover_task = self.downloader.download_img(

@@ -88,8 +88,18 @@ class Downloader:
         file_name: str | None = None,
         headers: dict[str, str] | None = None,
         proxy: str | None | object = ...,
+        fallback_urls: list[str] | None = None,
     ) -> Path:
-        """流式下载"""
+        """流式下载
+
+        Args:
+            url: 主选直链
+            file_name: 落盘文件名；缺省由主选直链生成，备用直链共用同一文件名
+            headers: 请求头
+            proxy: 代理
+            fallback_urls: 备用直链。主选直链重试耗尽后依次尝试（抖音等平台
+                的 ``url_list`` 会同时给多个等价节点，个别节点会 403）
+        """
         if not file_name:
             file_name = generate_file_name(url)
         file_path = self.cfg.cache_dir / file_name
@@ -98,57 +108,80 @@ class Downloader:
             return file_path
         headers = headers or self.default_headers
         retries = self.cfg.download_retry_times
-        for attempt in range(retries + 1):
-            try:
-                async with self.client.get(
-                    url, headers=headers, allow_redirects=True, proxy=proxy
-                ) as response:
-                    if response.status >= 400:
-                        raise ClientError(f"HTTP {response.status} {response.reason}")
-                    content_length = response.content_length
-                    max_bytes = self.max_size * 1024 * 1024
 
-                    if content_length == 0:
-                        logger.warning(f"媒体 url: {url}, 大小为 0, 取消下载")
-                        raise ZeroSizeException
-                    if content_length and content_length > max_bytes:
+        candidates = [url]
+        for item in fallback_urls or []:
+            if item and item not in candidates:
+                candidates.append(item)
+
+        last_exc: Exception | None = None
+        for index, candidate in enumerate(candidates):
+            for attempt in range(retries + 1):
+                try:
+                    async with self.client.get(
+                        candidate, headers=headers, allow_redirects=True, proxy=proxy
+                    ) as response:
+                        if response.status >= 400:
+                            raise ClientError(
+                                f"HTTP {response.status} {response.reason}"
+                            )
+                        content_length = response.content_length
+                        max_bytes = self.max_size * 1024 * 1024
+
+                        if content_length == 0:
+                            logger.warning(f"媒体 url: {candidate}, 大小为 0, 取消下载")
+                            raise ZeroSizeException
+                        if content_length and content_length > max_bytes:
+                            logger.warning(
+                                f"媒体 url: {candidate} 大小 {content_length / 1024 / 1024:.2f} MB 超过 {self.max_size} MB, 取消下载"
+                            )
+                            raise SizeLimitException
+
+                        downloaded = 0
+                        with self.get_progress_bar(file_name, content_length) as bar:
+                            async with aiofiles.open(file_path, "wb") as file:
+                                async for chunk in response.content.iter_chunked(
+                                    1024 * 1024
+                                ):
+                                    downloaded += len(chunk)
+                                    if downloaded > max_bytes:
+                                        raise SizeLimitException
+                                    await file.write(chunk)
+                                    bar.update(len(chunk))
+
+                        if downloaded == 0:
+                            logger.warning(
+                                f"媒体 url: {candidate}, 实际大小为 0, 取消下载"
+                            )
+                            raise ZeroSizeException
+                        if content_length and downloaded < content_length:
+                            raise ClientError(
+                                f"HTTP payload incomplete {downloaded}/{content_length}"
+                            )
+
+                    if index:
+                        logger.info(
+                            f"[下载] 备用直链第 {index} 条成功 | {candidate[:120]}"
+                        )
+                    return file_path
+                except (ZeroSizeException, SizeLimitException):
+                    await safe_unlink(file_path)
+                    raise
+                except (ClientError, TimeoutError) as exc:
+                    await safe_unlink(file_path)
+                    last_exc = exc
+                    if attempt < retries:
+                        await sleep(1 + attempt)
+                        continue
+                    if index + 1 < len(candidates):
                         logger.warning(
-                            f"媒体 url: {url} 大小 {content_length / 1024 / 1024:.2f} MB 超过 {self.max_size} MB, 取消下载"
+                            f"[下载] 主选直链失败（{exc}），改用备用直链第 {index + 1} 条"
                         )
-                        raise SizeLimitException
+                        break
+                    logger.exception(f"下载失败 | url: {candidate}, file_path: {file_path}")
+                    raise DownloadException("媒体下载失败") from exc
 
-                    downloaded = 0
-                    with self.get_progress_bar(file_name, content_length) as bar:
-                        async with aiofiles.open(file_path, "wb") as file:
-                            async for chunk in response.content.iter_chunked(
-                                1024 * 1024
-                            ):
-                                downloaded += len(chunk)
-                                if downloaded > max_bytes:
-                                    raise SizeLimitException
-                                await file.write(chunk)
-                                bar.update(len(chunk))
-
-                    if downloaded == 0:
-                        logger.warning(f"媒体 url: {url}, 实际大小为 0, 取消下载")
-                        raise ZeroSizeException
-                    if content_length and downloaded < content_length:
-                        raise ClientError(
-                            f"HTTP payload incomplete {downloaded}/{content_length}"
-                        )
-
-                return file_path
-            except (ZeroSizeException, SizeLimitException):
-                await safe_unlink(file_path)
-                raise
-            except (ClientError, TimeoutError) as exc:
-                await safe_unlink(file_path)
-                if attempt < retries:
-                    await sleep(1 + attempt)
-                    continue
-                logger.exception(f"下载失败 | url: {url}, file_path: {file_path}")
-                raise DownloadException("媒体下载失败") from exc
-        raise DownloadException("媒体下载失败")
+        raise DownloadException("媒体下载失败") from last_exc
 
     @staticmethod
     def get_progress_bar(desc: str, total: int | None = None) -> tqdm:
@@ -179,11 +212,16 @@ class Downloader:
         video_name: str | None = None,
         headers: dict[str, str] | None = None,
         proxy: str | None = None,
+        fallback_urls: list[str] | None = None,
     ) -> Path:
         if video_name is None:
             video_name = generate_file_name(url, ".mp4")
         return await self.streamd(
-            url, file_name=video_name, headers=headers, proxy=proxy
+            url,
+            file_name=video_name,
+            headers=headers,
+            proxy=proxy,
+            fallback_urls=fallback_urls,
         )
 
     @auto_task
@@ -194,11 +232,16 @@ class Downloader:
         audio_name: str | None = None,
         headers: dict[str, str] | None = None,
         proxy: str | None = None,
+        fallback_urls: list[str] | None = None,
     ) -> Path:
         if audio_name is None:
             audio_name = generate_file_name(url, ".mp3")
         return await self.streamd(
-            url, file_name=audio_name, headers=headers, proxy=proxy
+            url,
+            file_name=audio_name,
+            headers=headers,
+            proxy=proxy,
+            fallback_urls=fallback_urls,
         )
 
     @auto_task
@@ -209,11 +252,16 @@ class Downloader:
         file_name: str | None = None,
         headers: dict[str, str] | None = None,
         proxy: str | None | object = ...,
+        fallback_urls: list[str] | None = None,
     ) -> Path:
         if file_name is None:
             file_name = generate_file_name(url, ".zip")
         return await self.streamd(
-            url, file_name=file_name, headers=headers, proxy=proxy
+            url,
+            file_name=file_name,
+            headers=headers,
+            proxy=proxy,
+            fallback_urls=fallback_urls,
         )
 
     @auto_task
@@ -224,10 +272,17 @@ class Downloader:
         img_name: str | None = None,
         headers: dict[str, str] | None = None,
         proxy: str | None | object = ...,
+        fallback_urls: list[str] | None = None,
     ) -> Path:
         if img_name is None:
             img_name = generate_file_name(url, ".jpg")
-        return await self.streamd(url, file_name=img_name, headers=headers, proxy=proxy)
+        return await self.streamd(
+            url,
+            file_name=img_name,
+            headers=headers,
+            proxy=proxy,
+            fallback_urls=fallback_urls,
+        )
 
     async def download_imgs_without_raise(
         self,

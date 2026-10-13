@@ -7,6 +7,7 @@ from msgspec import Struct, field
 
 from ...utils import clean_song_title
 from ..base import ParseException
+from .urlpick import order
 
 
 def parse_song_title(extra: Any) -> str | None:
@@ -83,14 +84,36 @@ class VideoData(Struct):
         return self.music.song_title if self.music else None
 
     @property
+    def image_url_lists(self) -> list[list[str]]:
+        """每张图的全部候选直链（按可用性排序，首选在前）"""
+        return [order(image.url_list) for image in (self.images or [])]
+
+    @property
     def image_urls(self) -> list[str]:
-        return [choice(image.url_list) for image in self.images] if self.images else []
+        return [urls[0] if urls else "" for urls in self.image_url_lists]
+
+    @property
+    def image_fallbacks(self) -> dict[str, list[str]]:
+        """{主选直链: [备用直链...]}"""
+        return {
+            urls[0]: urls[1:] for urls in self.image_url_lists if len(urls) > 1
+        }
+
+    @property
+    def video_urls(self) -> list[str]:
+        """视频的全部候选直链（playwm 已换成 play）"""
+        if not self.video:
+            return []
+        return [u.replace("playwm", "play") for u in order(self.video.play_addr.url_list)]
 
     @property
     def video_url(self) -> str | None:
-        if not self.video or not self.video.play_addr.url_list:
-            return None
-        return choice(self.video.play_addr.url_list).replace("playwm", "play")
+        urls = self.video_urls
+        return urls[0] if urls else None
+
+    @property
+    def video_fallbacks(self) -> list[str]:
+        return self.video_urls[1:]
 
     @property
     def play_token(self) -> str | None:
@@ -109,14 +132,16 @@ class VideoData(Struct):
 
     @property
     def cover_url(self) -> str | None:
-        return choice(self.video.cover.url_list) if self.video else None
+        if not self.video:
+            return None
+        urls = order(self.video.cover.url_list)
+        return urls[0] if urls else None
 
     @property
     def avatar_url(self) -> str | None:
-        if avatar := self.author.avatar_thumb:
-            return choice(avatar.url_list)
-        elif avatar := self.author.avatar_medium:
-            return choice(avatar.url_list)
+        for node in (self.author.avatar_thumb, self.author.avatar_medium):
+            if node is not None and (urls := order(node.url_list)):
+                return urls[0]
         return None
 
 

@@ -242,8 +242,13 @@ class BaseParser:
         cover_url: str | None = None,
         duration: float = 0.0,
         headers: dict[str, str] | None = None,
+        fallback_urls: list[str] | None = None,
     ):
-        """创建视频内容"""
+        """创建视频内容
+
+        Args:
+            fallback_urls: 主直链失败时的备用直链（部分平台一次给多个等价节点）
+        """
         cover_task = None
         if cover_url:
             cover_task = self.downloader.download_img(
@@ -251,7 +256,10 @@ class BaseParser:
             )
         if isinstance(url_or_task, str):
             url_or_task = self.downloader.download_video(
-                url_or_task, headers=headers or self.headers, proxy=self.proxy
+                url_or_task,
+                headers=headers or self.headers,
+                proxy=self.proxy,
+                fallback_urls=fallback_urls,
             )
 
         return VideoContent(url_or_task, cover_task, duration)
@@ -275,12 +283,21 @@ class BaseParser:
         self,
         image_urls: list[str],
         headers: dict[str, str] | None = None,
+        fallbacks: dict[str, list[str]] | None = None,
     ):
-        """创建图片内容列表"""
+        """创建图片内容列表
+
+        Args:
+            image_urls: 每张图的主选直链
+            fallbacks: {主选直链: [备用直链...]}，主选 403 时自动换节点重试
+        """
         contents: list[ImageContent] = []
         for url in image_urls:
             task = self.downloader.download_img(
-                url, headers=headers or self.headers, proxy=self.proxy
+                url,
+                headers=headers or self.headers,
+                proxy=self.proxy,
+                fallback_urls=(fallbacks or {}).get(url),
             )
             contents.append(ImageContent(task))
         return contents
@@ -289,12 +306,20 @@ class BaseParser:
         self,
         dynamic_urls: list[str],
         headers: dict[str, str] | None = None,
+        fallbacks: dict[str, list[str]] | None = None,
     ):
-        """创建动态图片内容列表"""
+        """创建动态图片内容列表
+
+        Args:
+            fallbacks: {主选直链: [备用直链...]}
+        """
         contents: list[DynamicContent] = []
         for url in dynamic_urls:
             task = self.downloader.download_video(
-                url, headers=headers or self.headers, proxy=self.proxy
+                url,
+                headers=headers or self.headers,
+                proxy=self.proxy,
+                fallback_urls=(fallbacks or {}).get(url),
             )
             contents.append(DynamicContent(task))
         return contents

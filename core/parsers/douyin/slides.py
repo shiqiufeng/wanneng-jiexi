@@ -1,6 +1,6 @@
-from random import choice
-
 from msgspec import Struct, field
+
+from .urlpick import order
 
 
 class PlayAddr(Struct):
@@ -43,12 +43,31 @@ class SlidesData(Struct):
         return self.author.nickname
 
     @property
-    def avatar_url(self) -> str:
-        return choice(self.author.avatar_thumb.url_list)
+    def avatar_url(self) -> str | None:
+        urls = order(self.author.avatar_thumb.url_list)
+        return urls[0] if urls else None
+
+    @property
+    def image_url_lists(self) -> list[list[str]]:
+        """每张图的全部候选直链（按可用性排序，首选在前）
+
+        接口一次会给 3~4 个等价节点，个别节点（``*-pc-sign``、``*-ex-gddgtc-*``）
+        会 403，因此保留整组候选供下载时回退，而不是随机挑一条。
+        """
+        return [order(image.url_list) for image in self.images]
 
     @property
     def image_urls(self) -> list[str]:
-        return [choice(image.url_list) for image in self.images]
+        return [urls[0] if urls else "" for urls in self.image_url_lists]
+
+    @property
+    def image_fallbacks(self) -> dict[str, list[str]]:
+        """{主选直链: [备用直链...]}"""
+        return {
+            urls[0]: urls[1:]
+            for urls in self.image_url_lists
+            if len(urls) > 1
+        }
 
 
 class SlidesInfo(Struct):

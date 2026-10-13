@@ -36,6 +36,10 @@ from typing import Any
 
 from aiohttp import ClientTimeout
 
+from astrbot.api import logger
+
+from .urlpick import order
+
 # 移动端 App UA：必须是 App 形态，浏览器 UA 会被拒绝
 MOBILE_UA = (
     "com.ss.android.ugc.aweme/300500 (Linux; U; Android 13; zh_CN; "
@@ -57,12 +61,7 @@ FEED_AIDS: tuple[str, ...] = ("6383", "1128")
 
 
 #: 实测该节点对部分资源（尤其 image-cut-tos-priv 封面）返回 403，同路径的
-#: p9 / p6 / p11 节点正常，因此有替代时把它排到最后
-_BAD_NODE = "p3-pc-sign.douyinpic.com"
-
-
-def _is_bad_node(url: str) -> bool:
-    return _BAD_NODE in url
+#: p9 / p6 / p11 节点正常 —— 具体排序规则见 urlpick.order()
 
 
 def _https_urls(node: Any) -> list[str]:
@@ -75,36 +74,46 @@ def _https_urls(node: Any) -> list[str]:
     return [u for u in urls if isinstance(u, str) and u.startswith(("http://", "https://"))]
 
 
+def _clean(url: str) -> str:
+    """去掉带水印的 playwm 端点"""
+    return url.replace("playwm", "play")
+
+
 def _ordered(urls: list[str]) -> list[str]:
-    """好节点排前面（有替代时把已知会 403 的节点降到最后）"""
-    if len(urls) < 2:
-        return urls
-    good = [u for u in urls if not _is_bad_node(u)]
-    bad = [u for u in urls if _is_bad_node(u)]
-    return good + bad if good else urls
+    """好节点排前面，并统一去掉 playwm 水印端点"""
+    return [_clean(u) for u in order(urls)]
+
+
+def _play_urls(node: Any) -> list[str]:
+    """取 play_addr / cover 之类节点里的全部候选直链（按可用性排序）"""
+    return _ordered(_https_urls(node))
 
 
 def _play_url(node: Any) -> str | None:
-    """取 play_addr / cover 之类节点里的直链（跳过已知坏节点，顺手去水印）"""
-    urls = _ordered(_https_urls(node))
-    if not urls:
-        return None
-    return urls[0].replace("playwm", "play")
+    """取节点里的首选直链"""
+    urls = _play_urls(node)
+    return urls[0] if urls else None
+
+
+def pick_image_urls(node: Any) -> list[str]:
+    """图集静态图的候选直链（原图 jpeg 优先，webp 备选）"""
+    return _ordered(_https_urls(node))
 
 
 def pick_image_url(node: Any) -> str | None:
-    """图集静态图：偏取 ``url_list`` 末项（最高清无水印原图），并避开坏节点"""
-    urls = _https_urls(node)
-    if not urls:
-        return None
-    for url in reversed(urls):
-        if not _is_bad_node(url):
-            return url
-    return urls[-1]
+    """图集静态图的首选直链"""
+    urls = pick_image_urls(node)
+    return urls[0] if urls else None
 
 
 def pick_aweme(body: Any, aweme_id: str) -> dict[str, Any] | None:
-    """从 feed 响应里挑出目标作品；找不到时退而取第一条"""
+    """从 feed 响应里挑出目标作品
+
+    **只认精确命中**：该协议返回的是「推荐流」，被请求的作品通常排在首位，
+    但并非总是出现（实测部分 slides 作品就不在列表里）。此前找不到时会退而
+    取第一条，会把一条毫不相干的视频当成用户要的链接发出去，因此改为严格匹配，
+    匹配不到就交给上层走其它通道。
+    """
     if not isinstance(body, dict):
         return None
     items = body.get("aweme_list")
@@ -113,8 +122,12 @@ def pick_aweme(body: Any, aweme_id: str) -> dict[str, Any] | None:
     for it in items:
         if isinstance(it, dict) and str(it.get("aweme_id")) == str(aweme_id):
             return it
-    first = items[0]
-    return first if isinstance(first, dict) else None
+    logger.debug(
+        "[抖音] 移动端 feed 未包含目标作品 %s，实际返回: %s",
+        aweme_id,
+        [str(it.get("aweme_id")) for it in items[:5] if isinstance(it, dict)],
+    )
+    return None
 
 
 async def fetch_aweme(
@@ -165,49 +178,72 @@ def images(aweme: dict[str, Any]) -> list[dict[str, Any]]:
     return [i for i in raw if isinstance(i, dict)] if isinstance(raw, list) else []
 
 
-def image_urls(aweme: dict[str, Any]) -> list[str]:
-    """图集静态图直链列表（保持与 images 相同下标顺序）
+def image_url_lists(aweme: dict[str, Any]) -> list[list[str]]:
+    """图集每张图的候选直链（保持与 images 相同下标顺序，首选在前）"""
+    return [pick_image_urls(img) for img in images(aweme)]
 
-    ``url_list`` 末项通常是最高清的无水印原图，优先取它。
-    """
-    return [pick_image_url(img) or "" for img in images(aweme)]
+
+def image_urls(aweme: dict[str, Any]) -> list[str]:
+    """图集静态图首选直链列表（保持与 images 相同下标顺序）"""
+    return [urls[0] if urls else "" for urls in image_url_lists(aweme)]
+
+
+def image_fallbacks(aweme: dict[str, Any]) -> dict[str, list[str]]:
+    """{静态图首选直链: [备用直链...]}，供下载时逐条回退"""
+    return {
+        urls[0]: urls[1:] for urls in image_url_lists(aweme) if len(urls) > 1
+    }
+
+
+def live_urls(image: dict[str, Any]) -> list[str]:
+    """单张图的实况 mp4 候选直链；不是实况图返回空列表"""
+    video = image.get("video")
+    if not isinstance(video, dict):
+        return []
+    return best_play_urls(video)
 
 
 def live_url(image: dict[str, Any]) -> str | None:
-    """单张图的实况 mp4 直链；不是实况图返回 None
-
-    ``images[].video`` 里既有 ``play_addr``（唯一档），也有 ``bit_rate`` 多档，
-    这里优先按码率挑 H.264 最高档。
-    """
-    video = image.get("video")
-    if not isinstance(video, dict):
-        return None
-    return best_play_url(video)
+    """单张图的实况 mp4 首选直链；不是实况图返回 None"""
+    urls = live_urls(image)
+    return urls[0] if urls else None
 
 
-def best_play_url(video: dict[str, Any]) -> str | None:
-    """从 video 对象里挑最优直链
+def best_play_urls(video: dict[str, Any]) -> list[str]:
+    """从 video 对象里挑最优直链，并返回同档位的备用节点
 
     规则与文档一致：优先 ``is_h265 == 0``（兼容性最好，H.265 在部分客户端黑屏），
     同编码内取码率最高档；没有 ``bit_rate`` 时退回 ``play_addr``。
+    返回列表首条即最优档，其余为同一文件的其它节点/档位，主选 403 时依次回退。
     """
-    candidates: list[tuple[int, int, str]] = []  # (是否h264, 码率, url)
+    entries: list[tuple[int, int, list[str]]] = []  # (是否h265, 码率, 候选直链)
     for entry in video.get("bit_rate") or []:
         if not isinstance(entry, dict):
             continue
-        url = _play_url(entry.get("play_addr"))
-        if not url:
+        urls = _play_urls(entry.get("play_addr"))
+        if not urls:
             continue
         is_h264 = 0 if entry.get("is_h265") in (0, None) else 1
         bit_rate = entry.get("bit_rate")
-        candidates.append((is_h264, int(bit_rate or 0), url))
+        entries.append((is_h264, int(bit_rate or 0), urls))
 
-    if candidates:
+    if entries:
         # 先按 h264 优先，再按码率降序
-        candidates.sort(key=lambda c: (c[0], -c[1]))
-        return candidates[0][2]
+        entries.sort(key=lambda c: (c[0], -c[1]))
+        result: list[str] = []
+        for _, _, urls in entries:
+            for url in urls:
+                if url not in result:
+                    result.append(url)
+        return result
 
-    return _play_url(video.get("play_addr"))
+    return _play_urls(video.get("play_addr"))
+
+
+def best_play_url(video: dict[str, Any]) -> str | None:
+    """从 video 对象里挑首选直链"""
+    urls = best_play_urls(video)
+    return urls[0] if urls else None
 
 
 def is_image_post(aweme: dict[str, Any]) -> bool:
@@ -226,19 +262,26 @@ def cover_url(aweme: dict[str, Any]) -> str | None:
     return None
 
 
-def video_url(aweme: dict[str, Any]) -> str | None:
-    """视频作品的 mp4 直链
+def video_urls(aweme: dict[str, Any]) -> list[str]:
+    """视频作品的 mp4 候选直链（首选在前）
 
     注意：图集作品的 ``aweme["video"]`` 里放的是**背景音乐**（.mp3），
     调用方需先用 :func:`is_image_post` 分流，这里也额外做一层过滤。
     """
     video = aweme.get("video")
     if not isinstance(video, dict):
-        return None
-    url = best_play_url(video)
-    if not url or url.endswith(".mp3") or "ies-music" in url:
-        return None
-    return url
+        return []
+    return [
+        u
+        for u in best_play_urls(video)
+        if not u.endswith(".mp3") and "ies-music" not in u
+    ]
+
+
+def video_url(aweme: dict[str, Any]) -> str | None:
+    """视频作品的首选 mp4 直链"""
+    urls = video_urls(aweme)
+    return urls[0] if urls else None
 
 
 def duration(aweme: dict[str, Any]) -> int:
