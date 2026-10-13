@@ -53,7 +53,7 @@ EXCLUDE_DIRS = {
 EXCLUDE_SUFFIXES = {".pyc", ".pyo", ".pyd", ".log", ".zip"}
 
 # 需要排除的文件名
-EXCLUDE_FILES = {".DS_Store", "Thumbs.db", ".gitignore"}
+EXCLUDE_FILES = {".DS_Store", "Thumbs.db", ".gitignore", ".gitattributes"}
 
 
 def read_metadata_field(field: str) -> str | None:
