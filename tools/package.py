@@ -16,7 +16,9 @@ zip 内部顶层目录即插件包名（与 metadata.yaml 的 name 一致），
 说明：
 - 包名自动读取 ``metadata.yaml`` 的 ``name`` 字段，避免改名后脚本与插件不同步；
 - ASCII 别名自动取自 ``metadata.yaml`` 的 ``repo`` 仓库名，没有则退化为 ``plugin``；
-- 自动排除开发期目录（``outputs`` / ``.workbuddy`` / ``_dshprobe`` 等）与字节码缓存。
+- 自动排除开发期目录（``outputs`` / ``.workbuddy`` / ``_dshprobe`` 等）与字节码缓存；
+- ``tools/`` 整体排除，但**随包附带上部署自检脚本**（``diagnose_douyin.py`` 与
+  ``setup_browser.sh``）——服务器上装了插件就能直接 `python tools/diagnose_douyin.py --install`。
 """
 
 from __future__ import annotations
@@ -55,6 +57,12 @@ EXCLUDE_SUFFIXES = {".pyc", ".pyo", ".pyd", ".log", ".zip"}
 # 需要排除的文件名
 EXCLUDE_FILES = {".DS_Store", "Thumbs.db", ".gitignore", ".gitattributes"}
 
+# 尽管在 EXCLUDE_DIRS 里，但这些路径要随包发出去（服务器上直接就能跑）
+INCLUDE_PATHS = {
+    "tools/diagnose_douyin.py",
+    "tools/setup_browser.sh",
+}
+
 
 def read_metadata_field(field: str) -> str | None:
     """从 metadata.yaml 读取指定字段（不依赖 PyYAML）"""
@@ -86,6 +94,10 @@ def iter_files():
             continue
 
         rel = path.relative_to(ROOT)
+        posix = rel.as_posix()
+        if posix in INCLUDE_PATHS:
+            yield path, rel
+            continue
         if any(part in EXCLUDE_DIRS for part in rel.parts[:-1]):
             continue
         if rel.name in EXCLUDE_FILES or path.suffix.lower() in EXCLUDE_SUFFIXES:

@@ -22,11 +22,29 @@ from __future__ import annotations
 
 import keyword
 import os
+import re
 import sys
 import zipfile
 from pathlib import Path
 
-import yaml
+try:  # PyYAML 为可选依赖：缺失时退回极简解析（本插件 metadata.yaml 只有 key: value）
+    import yaml
+except Exception:  # pragma: no cover
+    yaml = None  # type: ignore[assignment]
+
+
+def load_metadata(text: str) -> dict:
+    """解析 metadata.yaml（优先 yaml，缺失时用行级 key: value 兜底）"""
+    if yaml is not None:
+        return yaml.safe_load(text) or {}
+    data: dict[str, str] = {}
+    for line in text.splitlines():
+        line = line.strip()
+        if not line or line.startswith("#") or ":" not in line:
+            continue
+        key, _, value = line.partition(":")
+        data[key.strip()] = value.strip().strip("\"'")
+    return data
 
 ROOT = Path(__file__).resolve().parent.parent
 
@@ -151,11 +169,11 @@ def main() -> int:
             if len(raw) > PLUGIN_METADATA_MAX_BYTES:
                 problems.append("metadata.yaml 超过 1MB")
             try:
-                metadata = yaml.safe_load(raw.decode("utf-8"))
+                metadata = load_metadata(raw.decode("utf-8"))
             except UnicodeDecodeError:
                 problems.append("metadata 必须使用 UTF-8 编码")
                 metadata = None
-            except yaml.YAMLError as exc:
+            except Exception as exc:  # noqa: BLE001
                 problems.append(f"metadata YAML 解析失败: {exc}")
                 metadata = None
 

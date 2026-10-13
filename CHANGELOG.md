@@ -1,5 +1,29 @@
 # 更新日志
 
+## v1.7.3
+
+### 修复
+
+- **Linux（Ubuntu / Debian）服务器不再白试一次 Edge**：`browser_channel` 默认值由 `msedge`
+  改为 `auto`，`BrowserFetcher.candidates()` 按平台排序尝试顺序——Windows 试
+  `msedge → chrome → 自带 chromium`，macOS 试 `chrome → msedge → 自带 chromium`，
+  **Linux 试 `chrome → chromium → 自带 chromium`**。Linux 上没有 Edge，此前每次都先失败一次
+  再回落，日志噪音大且首启更慢。
+- **报错提示改成可直接照抄的命令**：内核缺失时提示
+  `python -m playwright install --with-deps chromium`，并给出
+  `PLAYWRIGHT_DOWNLOAD_HOST=https://npmmirror.com/mirrors/playwright` 国内镜像与
+  Ubuntu 的 `apt-get install libnss3 libnspr4 ...` 依赖清单。
+
+### 新增
+
+- `browser_channel` 新增 `executable:/usr/bin/google-chrome` 写法，可直接指定系统浏览器可执行文件；
+  另支持环境变量 `WANNENG_BROWSER_CHANNEL` 覆盖配置（改配置不方便时用）。
+- 自检脚本新增一键安装：`python tools/diagnose_douyin.py --install`
+  （自动装 playwright 包 + Chromium 内核 + 系统依赖，默认走 npmmirror 镜像，装完继续自检）。
+- 自检脚本第 3 段现在同时报告 `chromium-*` 与 `chromium_headless_shell-*` 目录，
+  并检测系统里是否已有 chrome/chromium/msedge 可直接复用，最后按发行版打印可复制的修复命令。
+- 启动成功后日志会写明实际使用的通道（`[browser] 浏览器已启动: chrome`）。
+
 ## v1.7.2
 
 ### 修复

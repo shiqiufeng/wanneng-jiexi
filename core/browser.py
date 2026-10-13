@@ -16,12 +16,30 @@ Cookie）都会被拒，返回：
 
 浏览器为懒加载：首次请求时启动，空闲 `idle_timeout` 秒后自动关闭，避免常驻
 占用内存。未安装 playwright 时 `available` 为 False，调用方应回退到普通 HTTP。
+
+通道选择
+--------
+`channel="auto"`（默认）会按平台给出尝试顺序：
+
+* Windows：``msedge`` → ``chrome`` → 自带 chromium
+* macOS：``chrome`` → ``msedge`` → 自带 chromium
+* Linux（云服务器 / 容器）：``chrome`` → ``chromium`` → 自带 chromium
+
+Linux 上没有 Edge，所以默认不再白试一次 ``msedge``。如果服务器上压根没装过
+浏览器，**必须**先给 playwright 下载自带内核：
+
+    python -m playwright install --with-deps chromium
+
+也可用环境变量 ``WANNENG_BROWSER_CHANNEL`` 覆盖配置，例如指向系统 Chrome：
+
+    WANNENG_BROWSER_CHANNEL=executable:/usr/bin/google-chrome
 """
 
 from __future__ import annotations
 
 import asyncio
 import os
+import sys
 from typing import Any
 
 from astrbot.api import logger
@@ -61,8 +79,8 @@ class BrowserFetcher:
     """用真实浏览器页面代发 GET 请求并返回 JSON
 
     Args:
-        channel: 指定复用的系统浏览器通道（如 msedge、chrome）；为空则用
-            playwright 自带的 chromium
+        channel: 指定复用的系统浏览器通道（如 msedge、chrome），``auto`` 表示
+            按平台自动排序；``executable:/绝对路径`` 可直接指定浏览器可执行文件
         idle_timeout: 空闲多少秒后自动关闭浏览器
         warmup_wait: 打开首页后等待 secsdk 就绪的毫秒数
     """
@@ -73,13 +91,16 @@ class BrowserFetcher:
         self,
         *,
         headless: bool = True,
-        channel: str | None = "msedge",
+        channel: str | None = "auto",
         idle_timeout: int = 300,
         warmup_wait: int = 6000,
         nav_timeout: int = 60,
     ) -> None:
         self.headless = headless
-        self.channel = channel or None
+        # 环境变量优先级最高：不改配置也能在服务器上一行修好通道
+        self.channel = (
+            os.environ.get("WANNENG_BROWSER_CHANNEL", "").strip() or channel or "auto"
+        )
         self.idle_timeout = idle_timeout
         self.warmup_wait = warmup_wait
         self.nav_timeout = nav_timeout
@@ -92,6 +113,8 @@ class BrowserFetcher:
         self._idle_handle: asyncio.TimerHandle | None = None
         # 最近一次启动/请求失败的原因，便于调用方把真实错误透给用户与日志
         self.last_error: str | None = None
+        # 实际成功启动所用的通道（"msedge" / "chromium" / "自带 chromium"）
+        self.launched_with: str | None = None
 
     @staticmethod
     def available() -> bool:
@@ -99,6 +122,36 @@ class BrowserFetcher:
         return async_playwright is not None
 
     # ---------------- 生命周期 ----------------
+
+    @staticmethod
+    def candidates(
+        channel: str | None, platform: str | None = None
+    ) -> list[tuple[str, dict[str, Any]]]:
+        """按平台给出「通道标签 + launch 参数」的尝试顺序
+
+        ``auto`` 时先试系统已装的浏览器，最后退回 playwright 自带 chromium。
+        显式指定通道（含 ``executable:`` 前缀）时只试它，再退回自带 chromium，
+        避免网络环境里静默换用另一个浏览器导致指纹不一致。
+        """
+        plat = (platform or sys.platform).lower()
+        ch = (channel or "auto").strip()
+
+        if ch.startswith("executable:"):
+            path = ch.split(":", 1)[1].strip()
+            if path:
+                return [(f"executable:{path}", {"executable_path": path}), ("自带 chromium", {})]
+            return [("自带 chromium", {})]
+
+        if ch and ch != "auto":
+            return [(ch, {"channel": ch}), ("自带 chromium", {})]
+
+        if plat.startswith("win"):
+            chain = ["msedge", "chrome"]
+        elif plat == "darwin":
+            chain = ["chrome", "msedge"]
+        else:  # Linux 及其它 POSIX：系统 Chrome → 自带 chromium(新无头) → 自带 chromium
+            chain = ["chrome", "chromium"]
+        return [(c, {"channel": c}) for c in chain] + [("自带 chromium", {})]
 
     @staticmethod
     def launch_args() -> list[str]:
@@ -128,25 +181,21 @@ class BrowserFetcher:
 
             self._pw = await async_playwright().start()
 
-            # 优先复用系统浏览器，失败再退回自带 chromium
-            candidates: list[dict[str, Any]] = []
-            if self.channel:
-                candidates.append({"channel": self.channel})
-            candidates.append({})
-
+            # 按平台顺序试系统浏览器，最后退回自带 chromium
             last_err: Exception | None = None
-            for extra in candidates:
+            for label, extra in self.candidates(self.channel):
                 try:
                     self._browser = await self._pw.chromium.launch(
                         headless=self.headless,
                         args=self.launch_args(),
                         **extra,
                     )
-                    logger.info(f"[browser] 浏览器已启动: {extra or 'chromium'}")
+                    self.launched_with = label
+                    logger.info(f"[browser] 浏览器已启动: {label}")
                     break
                 except Exception as e:  # noqa: BLE001
                     last_err = e
-                    logger.debug(f"[browser] 启动候选 {extra} 失败: {e}")
+                    logger.debug(f"[browser] 启动候选 {label} 失败: {e}")
 
             if self._browser is None:
                 await self._shutdown()
@@ -177,7 +226,9 @@ class BrowserFetcher:
                 raise RuntimeError(self.last_error) from e
 
             self.last_error = None
-            logger.info("[browser] 抖音页面就绪，接口请求将经页面代发")
+            logger.info(
+                f"[browser] 抖音页面就绪（通道: {self.launched_with}），接口请求将经页面代发"
+            )
             return self._page
 
     @staticmethod
@@ -185,15 +236,27 @@ class BrowserFetcher:
         """根据底层报错给出可执行的修复提示"""
         text = str(err or "")
         if "Executable doesn't exist" in text or "playwright install" in text:
-            return "；未下载浏览器内核，请执行 `python -m playwright install chromium`"
+            return (
+                "；未下载浏览器内核，请在 AstrBot 所在的虚拟环境里执行 "
+                "`python -m playwright install --with-deps chromium`"
+                "（Ubuntu/Debian 用 apt；下载慢可先 "
+                "`export PLAYWRIGHT_DOWNLOAD_HOST=https://npmmirror.com/mirrors/playwright`）"
+            )
         if "No such file or directory" in text and "chrome" in text.lower():
-            return "；系统无可用 Chrome/Edge，请执行 `python -m playwright install chromium`"
+            return "；系统无可用 Chrome/Edge，请执行 `python -m playwright install --with-deps chromium`"
         if "error while loading shared libraries" in text or "Host system is missing" in text:
-            return "；缺少系统库，请执行 `python -m playwright install-deps chromium`（CentOS/阿里云需手动 yum 装依赖）"
+            return (
+                "；缺少系统库，Ubuntu/Debian 执行 `python -m playwright install-deps chromium`；"
+                "CentOS/阿里云需手动装 nss nspr atk at-spi2-atk cups-libs libdrm libXcomposite "
+                "libXdamage libXrandr mesa-libgbm pango alsa-lib libxkbcommon"
+            )
+        if "root without --no-sandbox" in text:
+            return "；检测到 root 未加沙箱豁免，本插件 v1.7.0+ 已内置 --no-sandbox，请确认已升级"
         return ""
 
     async def _shutdown(self) -> None:
         """关闭页面/浏览器并释放 playwright"""
+        self.launched_with = None
         for obj in (self._page, self._context, self._browser):
             if obj is None:
                 continue

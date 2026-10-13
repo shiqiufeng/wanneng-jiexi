@@ -53,7 +53,8 @@ class DouyinParser(BaseParser):
         self.browser_fallback = self.mycfg.browser_fallback is not False
         self.browser = BrowserFetcher(
             headless=self.mycfg.browser_headless is not False,
-            channel=self.mycfg.browser_channel or "msedge",
+            # 空值 / "auto" 交由 BrowserFetcher 按平台排序（Linux 不会白试 msedge）
+            channel=self.mycfg.browser_channel or "auto",
             idle_timeout=int(self.mycfg.browser_idle_timeout or 300),
         )
 

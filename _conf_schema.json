@@ -280,9 +280,9 @@
                     },
                     "browser_channel": {
                         "description": "浏览器通道",
-                        "hint": "复用的系统浏览器：msedge（Edge）、chrome、msedge-beta 等。留空则用 playwright 自带 chromium（需另执行 playwright install chromium）。",
+                        "hint": "auto（推荐）= 按平台自动选：Windows 试 Edge→Chrome，Linux 试 Chrome→自带 Chromium。也可显式填 msedge / chrome / chromium，或 executable:/usr/bin/google-chrome 指定可执行文件。Linux 服务器上没有 Edge，必须先把自带内核装上：python -m playwright install --with-deps chromium。",
                         "type": "string",
-                        "default": "msedge"
+                        "default": "auto"
                     },
                     "browser_headless": {
                         "description": "浏览器无头模式",

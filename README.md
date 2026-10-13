@@ -127,22 +127,28 @@ pip install -r requirements.txt
   # 在 AstrBot 服务器上执行，Docker 请先 docker exec 进容器
   bash tools/setup_browser.sh /root/AstrBot/venv
 
-  # 或手动执行
+  # 或手动执行（推荐 --with-deps，一步装好内核 + 系统库）
+  python -m playwright install --with-deps chromium
+
+  # 下载慢就换国内镜像再重跑
+  export PLAYWRIGHT_DOWNLOAD_HOST=https://npmmirror.com/mirrors/playwright
   python -m playwright install chromium
-  python -m playwright install-deps chromium   # Debian/Ubuntu
   ```
 
+  > **Ubuntu 服务器默认不带任何浏览器**，「没有浏览器」是正常现象，不需要装桌面版 Chrome ——
+  > playwright 会下载自己独立的一份 Chromium（约 150 MB），装到 `~/.cache/ms-playwright`。
   > CentOS / 阿里云 Linux 等 RHEL 系系统上 `install-deps` 不支持 apt 流程，需手动 `yum install`。
   > `tools/setup_browser.sh` 已内置这些分支。
-  并且把配置项「浏览器通道」留空（Linux 上没有 Edge）。
+  配置项「浏览器通道」保持默认 `auto` 即可（会自动跳过 Linux 上不存在的 Edge）。
 
 **排查**：若会话里报「浏览器代发请求失败」，AstrBot 日志里会有一行 `[browser] ...` 说明真实原因
 （内核未下载 / 缺系统库 / 无法启动），按提示处理即可。
 
-**一键自检**（服务器上直接跑，不依赖插件模块）：
+**一键自检 / 一键安装**（服务器上直接跑，不依赖插件模块）：
 
 ```bash
-python tools/diagnose_douyin.py                 # 用内置样本作品做全链路检查
+python tools/diagnose_douyin.py --install       # 先自动装好 playwright + Chromium 内核，再做全链路检查
+python tools/diagnose_douyin.py                 # 仅检查，用内置样本作品
 python tools/diagnose_douyin.py <aweme_id>      # 检查指定作品
 ```
 
@@ -174,7 +180,7 @@ python tools/diagnose_douyin.py <aweme_id>      # 检查指定作品
 | `use_proxy` | 关 | 是否走全局代理 |
 | `cookies` | 空 | 选填，登录态 Cookie |
 | `browser_fallback` | 开 | 接口被风控拦截时启用浏览器兜底 |
-| `browser_channel` | `msedge` | 复用的系统浏览器，留空则用内置 Chromium |
+| `browser_channel` | `auto` | 浏览器通道。`auto`=按平台自动选（Linux: chrome→chromium→内置）；可填 `msedge`/`chrome`/`chromium`，或 `executable:/usr/bin/google-chrome`；也支持环境变量 `WANNENG_BROWSER_CHANNEL` |
 | `browser_headless` | 开 | 无头模式运行浏览器 |
 | `browser_idle_timeout` | 300 | 浏览器空闲多少秒后自动关闭 |
 
@@ -277,10 +283,12 @@ A：确认抖音解析器的「浏览器兜底」为开启状态，并确保运�
 
 **Q：会话里报「浏览器代发请求失败」？**
 A：这是浏览器兜底启动失败。看 AstrBot 日志里的 `[browser]` 行，会直接写明原因：
-`未下载浏览器内核` → 执行 `python -m playwright install chromium`；
+`未下载浏览器内核` → 执行 `python -m playwright install --with-deps chromium`；
 `缺少系统库` → 执行 `python -m playwright install-deps chromium`（RHEL 系需手动 yum）；
 `root 环境` → v1.7.1 起已自动附加 `--no-sandbox`，升级到该版本即可。
-Linux 服务器上直接跑 `bash tools/setup_browser.sh` 一次装齐并验证。
+Linux 服务器上直接跑 `python tools/diagnose_douyin.py --install`（一条命令装齐并自检），
+或 `bash tools/setup_browser.sh`。
+**Ubuntu 服务器本来就没有浏览器**，不需要装桌面 Chrome；playwright 会下载自己的 Chromium。
 
 **Q：实况图只发了静态图？**
 A：确认作品本身带实况；快手（含极速版）暂不支持取实况视频。抖音实况依赖详情接口，若浏览器兜底未生效也会退化为静态图。

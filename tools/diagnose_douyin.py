@@ -5,6 +5,7 @@
 
     python tools/diagnose_douyin.py
     python tools/diagnose_douyin.py 7695197082320078763   # 指定作品 ID
+    python tools/diagnose_douyin.py --install              # 顺手把浏览器内核装上再自检
 
 脚本不依赖本插件任何模块，只用标准库 + playwright，可单独拷到服务器上跑。
 它会依次检查：Python 环境 → playwright 是否可导入 → Chromium 内核是否已下载
@@ -16,8 +17,11 @@ from __future__ import annotations
 
 import asyncio
 import glob
+import importlib.util
 import os
 import platform
+import shutil
+import subprocess
 import sys
 from pathlib import Path
 from urllib.parse import urlencode
@@ -87,6 +91,86 @@ def build_launch_args() -> list[str]:
     return args
 
 
+def build_candidates() -> list[tuple[str, dict]]:
+    """与 core/browser.py 的 BrowserFetcher.candidates("auto") 保持一致"""
+    if sys.platform.startswith("win"):
+        chain = ["msedge", "chrome"]
+    elif sys.platform == "darwin":
+        chain = ["chrome", "msedge"]
+    else:
+        chain = ["chrome", "chromium"]
+    return [(c, {"channel": c}) for c in chain] + [("自带 chromium", {})]
+
+
+def pkg_manager() -> str:
+    for name in ("apt-get", "dnf", "yum", "apk"):
+        if shutil.which(name):
+            return name
+    return ""
+
+
+def print_install_help() -> None:
+    """按系统打印可复制的安装命令"""
+    print("\n  可直接复制执行的修复命令（在 AstrBot 所在的 Python 环境里运行）:")
+    py = sys.executable
+    print(f"\n  # 0) 确认用的是 AstrBot 的解释器（不要用系统 python3）")
+    print(f"      {py} -V")
+    print(f"\n  # 1) 装浏览器内核 + 系统依赖（约 150 MB，首次慢）")
+    print(f"      {py} -m playwright install --with-deps chromium")
+    print(f"\n  # 2) 国内下载慢时先换镜像再重跑上一步")
+    print(f"      export PLAYWRIGHT_DOWNLOAD_HOST=https://npmmirror.com/mirrors/playwright")
+    print(f"      {py} -m playwright install chromium")
+    pm = pkg_manager()
+    if pm == "apt-get":
+        print(f"\n  # 3) 若第 1 步 --with-deps 失败，Ubuntu/Debian 手动补依赖")
+        print(f"      apt-get update && apt-get install -y libnss3 libnspr4 libatk1.0-0 \\")
+        print(f"        libatk-bridge2.0-0 libcups2 libdrm2 libxkbcommon0 libxcomposite1 \\")
+        print(f"        libxdamage1 libxfixes3 libxrandr2 libgbm1 libpango-1.0-0 libcairo2 \\")
+        print(f"        libasound2t64 fonts-liberation")
+        print(f"\n  # 4) Docker 部署：要先进容器再执行上面的命令")
+        print(f"      docker exec -it <AstrBot容器名> bash")
+    elif pm in ("dnf", "yum"):
+        print(f"\n  # 3) RHEL/CentOS/阿里云 {pm} 手动补依赖")
+        print(f"      {pm} install -y nss nspr atk at-spi2-atk cups-libs libdrm libXcomposite \\")
+        print(f"        libXdamage libXrandr mesa-libgbm pango alsa-lib libxkbcommon \\")
+        print(f"        libX11 libXcursor libXi libXtst liberation-fonts")
+    print(f"\n  # 5) 装完重跑本自检: {py} tools/diagnose_douyin.py\n")
+
+
+def do_install() -> int:
+    """--install：把 playwright 包 + Chromium 内核 + 系统依赖一次装齐"""
+    py = sys.executable
+    head(0, "安装浏览器内核（--install）")
+    print(f"  使用解释器: {py}")
+    env = dict(os.environ)
+    if not env.get("PLAYWRIGHT_DOWNLOAD_HOST"):
+        env["PLAYWRIGHT_DOWNLOAD_HOST"] = "https://npmmirror.com/mirrors/playwright"
+        print("  已自动启用国内镜像: npmmirror.com")
+
+    if importlib.util.find_spec("playwright") is None:
+        print("  [1/2] 安装 playwright Python 包 ...")
+        subprocess.run(
+            [py, "-m", "pip", "install", "--disable-pip-version-check",
+             "-i", "https://mirrors.aliyun.com/pypi/simple/", "playwright"],
+            check=False,
+        )
+    else:
+        print("  [1/2] playwright Python 包已存在，跳过")
+
+    print("  [2/2] 下载 Chromium 内核 + 系统依赖（约 150 MB，首次较慢，请耐心等待）...")
+    rc = subprocess.run(
+        [py, "-m", "playwright", "install", "--with-deps", "chromium"],
+        env=env, check=False,
+    ).returncode
+    if rc == 0:
+        print(f"{OK} 安装命令执行完成，继续下面的自检")
+    else:
+        print(f"{WA} 安装命令退出码 {rc}；若是 --with-deps 报错，可去掉该参数只装内核：")
+        print(f"      {py} -m playwright install chromium")
+        print_install_help()
+    return rc
+
+
 async def run(aweme_id: str) -> int:
     # ---------------- 1. 环境 ----------------
     head(1, "运行环境")
@@ -112,21 +196,35 @@ async def run(aweme_id: str) -> int:
     d = browsers_dir()
     print(f"  内核目录: {d}")
     kernel_hits: list[str] = []
+    shell_hits: list[str] = []
     if not d.exists():
         print(f"{WA} 目录不存在 —— 从未下载过浏览器内核目录")
     else:
         kernel_hits = sorted(glob.glob(str(d / "chromium-*")))
+        shell_hits = sorted(glob.glob(str(d / "chromium_headless_shell-*")))
         if kernel_hits:
             print(f"{OK} 发现 {len(kernel_hits)} 个 chromium 版本目录")
             for h in kernel_hits[:3]:
                 print(f"        {os.path.basename(h)}")
         else:
             print(f"{WA} 无 chromium-* 目录 —— 未下载自带内核")
-    if not kernel_hits:
-        print("  （若系统已装 Edge / Chrome，插件会复用它，通常不影响；")
-        print("     Linux 服务器上没有自带浏览器，**必须**下载内核）")
-        print("   修复: python -m playwright install chromium")
-        print("   国内下载慢: export PLAYWRIGHT_DOWNLOAD_HOST=https://npmmirror.com/mirrors/playwright")
+        if shell_hits:
+            print(f"{OK} 发现 {len(shell_hits)} 个 headless shell 目录")
+        else:
+            print(f"{WA} 无 chromium_headless_shell-* 目录 —— 无头模式会缺内核")
+
+    # 顺手看看系统里有没有可以直接复用的浏览器
+    found_sys = [p for p in ("google-chrome", "google-chrome-stable", "chromium",
+                             "chromium-browser", "microsoft-edge") if shutil.which(p)]
+    if found_sys:
+        print(f"  系统已装浏览器: {', '.join(found_sys)}")
+    elif os.name == "posix":
+        print("  系统已装浏览器: 无 —— Ubuntu 服务器默认不带浏览器，属正常现象")
+
+    if not (kernel_hits and shell_hits) or (os.name == "posix" and not found_sys and not kernel_hits):
+        print_install_help()
+    else:
+        print("\n  内核齐备，无需额外安装。")
 
     # ---------------- 4. 启动浏览器 ----------------
     head(4, "启动浏览器")
@@ -141,7 +239,7 @@ async def run(aweme_id: str) -> int:
         print(f"{NO} playwright 启动失败: {e}")
         return 1
 
-    for label, extra in (("msedge", {"channel": "msedge"}), ("chromium", {})):
+    for label, extra in build_candidates():
         try:
             browser = await pw.chromium.launch(headless=True, args=args, **extra)
             print(f"{OK} 启动成功（{label}）")
@@ -149,13 +247,12 @@ async def run(aweme_id: str) -> int:
         except Exception as e:
             print(f"{WA} {label} 启动失败: {str(e)[:200]}")
     if browser is None:
-        print(f"{NO} 两种通道都无法启动")
+        print(f"{NO} 所有通道都无法启动")
         print("\n  常见原因与修复:")
-        print("   · root 运行缺 --no-sandbox      → 本脚本已自动带上，若仍失败请看下一行")
-        print("   · 缺系统库                     → python -m playwright install-deps chromium")
-        print("     CentOS/阿里云 Linux 需手动: yum install -y nss nspr atk at-spi2-atk \\")
-        print("       cups-libs libdrm libXcomposite libXdamage libXrandr mesa-libgbm \\")
-        print("       pango alsa-lib libxkbcommon libX11 libXcursor libXi libXtst liberation-fonts")
+        print("   · 未下载内核  → python -m playwright install --with-deps chromium")
+        print("   · 缺系统库    → python -m playwright install-deps chromium")
+        print("   · root 运行缺 --no-sandbox → 本脚本已自动带上")
+        print_install_help()
         await pw.stop()
         return 1
 
@@ -264,7 +361,11 @@ async def run(aweme_id: str) -> int:
 
 
 def main() -> int:
-    aweme_id = sys.argv[1] if len(sys.argv) > 1 else DEFAULT_AWEME_ID
+    argv = sys.argv[1:]
+    if "--install" in argv:
+        do_install()
+    rest = [a for a in argv if not a.startswith("-")]
+    aweme_id = rest[0] if rest else DEFAULT_AWEME_ID
     try:
         return asyncio.run(run(aweme_id))
     except KeyboardInterrupt:
