@@ -306,9 +306,20 @@ class ParserPlugin(Star):
 
         if album is None:
             names = await uploader.album_names(bot, str(group_id))
-            tip = f"群里现有相册：{'、'.join(names)}" if names else "群里还没有相册"
+            if names:
+                tip = (
+                    "群里现有相册：" + "、".join(names) + "\n"
+                    f"把插件配置里的「相册名称」改成上面其中之一即可。"
+                )
+            else:
+                tip = (
+                    "没有读到任何群相册，请确认：\n"
+                    "· 群相册里确实已创建该相册，名称与配置完全一致\n"
+                    "· 协议端为 NapCat 且版本 ≥ v4.18.30\n"
+                    "管理员可用 /相册自检 查看逐项探测结果。"
+                )
             yield event.plain_result(
-                f"群里没有名为「{self.cfg.album_name}」的相册，请先在群相册里创建。\n{tip}"
+                f"没有找到名为「{self.cfg.album_name}」的群相册。\n{tip}"
             )
             return
 
@@ -648,7 +659,10 @@ class ParserPlugin(Star):
         elif names:
             lines.append("[失败] 相册名对不上，把「相册名称」改成上面列出的名字之一")
         else:
-            lines.append("[失败] 群里还没有相册，请先在群相册里创建一个")
+            lines.append(
+                "[失败] 没读到任何一个群相册：确认群相册里已建好相册，"
+                "且协议端 NapCat ≥ v4.18.30"
+            )
 
         # 探测各接口是否存在（只判 action 是否认得，不会真的上传）
         if album is not None:
